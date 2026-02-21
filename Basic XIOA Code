@@ -1,0 +1,45 @@
+#include <bluefruit.h> //Library used for Bluetooth and how to talk to the chips "radio" inside the chip.
+
+BLEUart bleuart; // Bluetooth Low Energy (BLE) is the class and the object is named bleuart.
+
+//--- TIMING Variables ---
+unsigned long lastTransmissionTime = 0;
+const long transmissionInterval = 1000; // Sending data every 1000 miliseconds (1 second). Using Const so XIOA will be told that this will not change when program is running.
+
+void setup() {
+  Serial.begin(115200); // baud rate speed.
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4); // Sets transmission power. The strongest setting in dBm for the nRF52840.
+  Bluefruit.setName("XIOA-Sensor 1"); // The unique name for the sensor.
+  
+  Bluefruit.Periph.setConnectCallback(onDeviceConnected);
+  Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
+
+  bleuart.begin();
+
+  configureAdvertising(); // Custom function for the process where the XIOA is ready to be discovered to be connected.
+  Bluefruit.Advertising.start(0); // Fucntion from bluefruit library to talk to radio hardware. Set to 0 so that is is continously trying to be disccovered until connected.
+}
+
+void loop(){
+  // Empty for now.
+}
+
+void configureAdvertising(void) {
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+}
+
+// These must exist because you "signed them up" in the setup()
+void onDeviceConnected(uint16_t conn_handle) {
+  Serial.println("Phone connected!");
+}
+
+void onDeviceDisconnected(uint16_t conn_handle, uint8_t reason) {
+  Serial.println("Phone disconnected.");
+}
