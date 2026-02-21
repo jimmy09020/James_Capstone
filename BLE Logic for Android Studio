@@ -1,0 +1,112 @@
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.content.Context
+import android.util.Log
+import java.util.*
+
+// This class is the connection between the phone and the XIOA sensors.
+class XiaoBleManager(private val context: Context) {
+
+    // --- THE ADDRESSES (UUIDs) ---
+    // These must match the "Nordic UART" standard that the Bluefruit library uses.
+    /**
+    6E400001 is the official numbers for Nordic Semiconductors. The same company that
+    makes the chips inside the XIOA.
+    */
+    private val XIAO_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+    private val XIAO_TX_CHAR_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+
+    // This is a special ID required by Android to "turn on" the data stream.
+    /**
+     * The 00002902 allows for the phone to listen for data updates. Basically,
+     * everytime the sensor changes, send the data to phone immediately.
+     */
+    private val CLIENT_CHARACTERISTIC_CONFIG_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    // --- THE TRACKER ---
+    // We store every active XIAO in this Map. 
+    // Key = MAC Address (like 'AA:BB:CC:00:11:22'), Value = The actual connection object.
+    private val activeGatts = mutableMapOf<String, BluetoothGatt>()
+
+    // --- 3. THE BRAIN (GATT CALLBACK) ---
+    // This part runs automatically whenever a XIAO responds to the phone.
+    private val gattCallback = object : BluetoothGattCallback() {
+
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            val address = gatt.device.address
+
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d("XiaoBLE", "Step 1: Successfully connected to $address")
+                // Once connected, we have to ask the XIAO: "What can you do?"
+                gatt.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d("XiaoBLE", "Step X: Connection lost with $address")
+                // Clean up: remove from our list and close the hardware port.
+                activeGatts.remove(address)
+                gatt.close()
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("XiaoBLE", "Step 2: Found services on the XIAO.")
+
+                // Look for the specific "Mailbox" (Service/Characteristic) we want.
+                val service = gatt.getService(XIAO_SERVICE_UUID)
+                val characteristic = service?.getCharacteristic(XIAO_TX_CHAR_UUID)
+
+                characteristic?.let {
+                    // Tell the phone to listen for data updates.
+                    gatt.setCharacteristicNotification(it, true)
+
+                    // Flip the "ON" switch inside the XIAO so it starts sending.
+                    val descriptor = it.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+                    Log.d("XiaoBLE", "Step 3: Notifications enabled. Ready for data!")
+                }
+            }
+        }
+
+        // --- 4. DATA RECEPTION ---
+        // This triggers every time the XIAO sends a new sensor reading.
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (characteristic.uuid == XIAO_TX_CHAR_UUID) {
+                // Convert raw sensor bytes into a readable String (text).
+                val data = String(characteristic.value, Charsets.UTF_8)
+                val senderAddress = gatt.device.address
+
+                // Send the data to your parsing function.
+                handleReceivedData(senderAddress, data)
+            }
+        }
+    }
+
+    // --- 5. ACTION COMMANDS ---
+
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(device: BluetoothDevice) {
+        val address = device.address
+        // Don't connect twice to the same XIAO!
+        if (!activeGatts.containsKey(address)) {
+            Log.d("XiaoBLE", "Attempting to connect to $address")
+            // This starts the connection process.
+            val gatt = device.connectGatt(context, false, gattCallback)
+            activeGatts[address] = gatt
+        }
+    }
+
+    private fun handleReceivedData(address: String, data: String) {
+        // This is where you will eventually update your UI or store sensor data.
+        Log.d("XiaoBLE", "MESSAGE FROM [$address]: $data")
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnectAll() {
+        Log.d("XiaoBLE", "Cleaning up all connections.")
+        activeGatts.values.forEach { it.disconnect() }
+        activeGatts.clear()
+    }
+}
