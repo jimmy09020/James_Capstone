@@ -1,0 +1,80 @@
+#include <bluefruit.h> // Library for Bluetooth radio
+#include <Wire.h>      // NEW: Library for I2C (Needed for BMP280)
+
+BLEUart bleuart; 
+
+// --- TIMING Variables ---
+unsigned long lastBlink = 0;
+const long blinkInterval = 500;
+unsigned long lastTransmissionTime = 0;
+const long transmissionInterval = 1000; 
+
+bool ledState = LOW;
+
+// --- BMP280 PLACEHOLDERS ---
+// We use these variables to store the data before sending it to the phone.
+float bmpTemp = 0.0;    
+float bmpPressure = 0.0; 
+
+void setup() {
+  Serial.begin(115200); 
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  // Initialize the I2C bus for the BMP280
+  Wire.begin(); 
+
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4); 
+  Bluefruit.setName("XIAO-Sensor 2"); // Personalized for Node 2
+  
+  Bluefruit.Periph.setConnectCallback(onDeviceConnected);
+  Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
+
+  bleuart.begin();
+
+  configureAdvertising(); 
+  Bluefruit.Advertising.start(0); 
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. HEARTBEAT BLINK
+  if (currentMillis - lastBlink >= blinkInterval) {
+    lastBlink = currentMillis; 
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState); 
+  }
+
+  // 2. DATA TRANSMISSION (Only if connected)
+  if (Bluefruit.connected()) {
+    if (currentMillis - lastTransmissionTime >= transmissionInterval) {
+      lastTransmissionTime = currentMillis; 
+
+      // FUTURE: Real BMP280 reading code will go here.
+      // For now, we send the "0.0" placeholders to test the Android app connection.
+      
+      String payload = "T:" + String(bmpTemp) + ",P:" + String(bmpPressure) + "\n";
+      bleuart.print(payload);
+      
+      Serial.print("TX Node 2 --> "); 
+      Serial.print(payload);
+    }
+  }
+}
+
+void configureAdvertising(void) {
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+}
+
+void onDeviceConnected(uint16_t conn_handle) {
+  Serial.println("Node 2: Phone connected!");
+}
+
+void onDeviceDisconnected(uint16_t conn_handle, uint8_t reason) {
+  Serial.println("Node 2: Phone disconnected.");
+}
