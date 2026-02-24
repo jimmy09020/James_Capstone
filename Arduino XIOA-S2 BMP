@@ -1,0 +1,63 @@
+#include <bluefruit.h> //Library used for Bluetooth and how to talk to the chips "radio" inside the chip.
+#include <Wire.h> // Library for I2C communication (how the XIAO talks to the BMP280 sensor).
+#include <Adafruit_Sensor.h> // Base library required for Adafruit sensors.
+#include <Adafruit_BMP280.h> // Specific library used for the BMP280 sensor.
+
+BLEUart bleuart; // Bluetooth Low Energy (BLE) is the class and the object is named bleuart.
+Adafruit_BMP280 bmp; // The class is Adafruit_BMP280 and the object is named bmp.
+
+//--- TIMING Variables ---
+unsigned long lastTransmissionTime = 0;
+const long transmissionInterval = 1000; // Sending data every 1000 miliseconds (1 second). Using Const so XIOA will be told that this will not change when program is running.
+
+void setup() {
+  Serial.begin(115200); // baud rate speed.
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  // Initialize the BMP280 sensor. 0x76 is the common I2C address for these sensor modules.
+  if (!bmp.begin(0x76)) {
+    Serial.println("Could not find a valid BMP280 sensor, check wiring!");
+    while (1); // Stop the program here forever if the sensor is not found.
+  }
+
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4); // Sets transmission power. The strongest setting in dBm for the nRF52840.
+  Bluefruit.setName("XIOA-Sensor 2"); // The unique name for the sensor.
+  
+  Bluefruit.Periph.setConnectCallback(onDeviceConnected);
+  Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
+
+  bleuart.begin();
+
+  configureAdvertising(); // Custom function for the process where the XIOA is ready to be discovered to be connected.
+  Bluefruit.Advertising.start(0); // Fucntion from bluefruit library to talk to radio hardware. Set to 0 so that is is continously trying to be disccovered until connected.
+}
+
+void loop(){
+  // Check if 1 second or 1000 miliseconds has passed since the last time data was sent
+  if (millis() - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = millis(); // Update the timer to the current time
+
+    // Read the raw data from the sensor
+    float temperature = bmp.readTemperature(); // Reads temperature in Celsius
+    float pressure = bmp.readPressure(); // Reads pressure in Pascals
+
+    // Print to the computer's Serial Monitor just so we can see it working locally
+    Serial.print("Temp: ");
+    Serial.print(temperature);
+    Serial.print(" C, Pressure: ");
+    Serial.print(pressure);
+    Serial.println(" Pa");
+
+    // Check if a phone (like your Android app) is actually connected right now
+    if (Bluefruit.connected()) {
+      // Send the data over Bluetooth to the phone
+      // We are formatting it simply as "T:25.50,P:101325.00"
+      bleuart.print("T:");
+      bleuart.print(temperature);
+      bleuart.print(",P:");
+      bleuart.println(pressure); // println adds a "newline" at the end so the phone knows the message is done
+    }
+  }
+}
