@@ -1,0 +1,161 @@
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.content.Context
+import android.util.Log
+import java.util.*
+
+// This class is the connection between the phone and the XIAO sensors.
+class XiaoBleManager(private val context: Context) { 
+    
+    // These must match the "Nordic UART" standard that the Blue fruit library uses.
+    // 6E400001 is the official ID for Nordic Semiconductors (the chip inside the XIAO).
+    private val XIAO_SERVICE_UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+
+    // 6E400003 is the specific "Transmission" (TX) channel where the XIAO sends data TO the phone.
+    private val XIAO_TX_CHAR_UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+
+    // This is a special ID required by Android to "turn on" the data stream.
+    // It allows the phone to listen for continuous data updates from the sensor.
+    private val CLIENT_CHARACTERISTIC_CONFIG_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    
+    // We store every active XIAO connection here.
+    // Key = MAC Address (like 'AA:BB:CC:00:11:22'), Value = The actual connection object.
+    private val activeGatts = mutableMapOf<String, BluetoothGatt>()
+    
+    // Bluetooth sends text in tiny 20-character chunks, our long sensor message gets chopped in half!
+    // This buffer temporarily holds the pieces and puts them together until the full message arrives.
+    private val deviceBuffers = mutableMapOf<String, StringBuilder>()
+    
+    // This part runs automatically whenever a XIAO responds to the phone.
+    private val gattCallback = object : BluetoothGattCallback() {
+
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            val address = gatt.device.address
+
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d("XiaoBLE", "Step 1: Successfully connected to $address")
+
+                // Create a fresh, empty text buffer for this specific XIAO
+                deviceBuffers[address] = java.lang.StringBuilder()
+
+                // Once connected, the code ask what the XIOA does.
+                gatt.discoverServices()
+
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d("XiaoBLE", "Step X: Connection lost with $address")
+                // Clean up: remove from our trackers and close the hardware port.
+                activeGatts.remove(address)
+                deviceBuffers.remove(address)
+                gatt.close()
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d("XiaoBLE", "Step 2: Found services on the XIAO.")
+
+                // Look for the specific (Service/Characteristic) we want.
+                val service = gatt.getService(XIAO_SERVICE_UUID)
+                val characteristic = service?.getCharacteristic(XIAO_TX_CHAR_UUID)
+
+                characteristic?.let {
+                    // Tell the Android phone itself to listen for data updates on this channel.
+                    gatt.setCharacteristicNotification(it, true)
+
+                    // Flip the "ON" switch inside the XIAO so it actively starts broadcasting.
+                    val descriptor = it.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(descriptor)
+
+                    Log.d("XiaoBLE", "Step 3: Notifications enabled. Ready for data!")
+                }
+            }
+        }
+        
+        // This triggers every time the XIAO sends a new chunk of sensor reading.
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (characteristic.uuid == XIAO_TX_CHAR_UUID) {
+
+                val senderAddress = gatt.device.address
+                // Convert raw incoming bytes into a readable String text chunk.
+                val newTextChunk = String(characteristic.value, Charsets.UTF_8)
+
+                // Get the buffer for this specific XIAO and glue the new chunk to the end of it
+                val buffer = deviceBuffers[senderAddress] ?: return
+                buffer.append(newTextChunk)
+
+                // Check if the buffer contains a newline "\n" (which means the Arduino finished sending a full message)
+                if (buffer.contains("\n")) {
+
+                    // Grab the completed glued-together string
+                    val fullMessage = buffer.toString()
+
+                    // Clear the buffer so it is empty and ready for the NEXT second's transmission
+                    buffer.clear()
+
+                    // Send the FULL data to our parsing function
+                    handleReceivedData(senderAddress, fullMessage)
+                }
+            }
+        }
+    }
+    
+
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(device: BluetoothDevice) {
+        val address = device.address
+        // Not connecting twice to the same XIAO
+        if (!activeGatts.containsKey(address)) {
+            Log.d("XiaoBLE", "Attempting to connect to $address")
+            // This starts the connection process.
+            val gatt = device.connectGatt(context, false, gattCallback)
+            activeGatts[address] = gatt
+        }
+    }
+
+    private fun handleReceivedData(address: String, data: String) {
+        
+        // -Parsing Logic-
+        Log.d("XiaoBLE", "FULL RAW MESSAGE FROM [$address]: $data")
+
+        // Clean up any spaces or newlines
+        val cleanMessage = data.trim()
+
+        // Break the message into pieces by commas (e.g. ["T:98.60", "P:101325.00", "HR:75"])
+        val dataChunks = cleanMessage.split(",")
+
+        var temperatureF = 0.0f
+        var pressurePa = 0.0f
+        var heartRateBpm = 0 // Changed to an Int since BPM is a whole number
+
+        for (chunk in dataChunks) {
+            val keyValuePair = chunk.split(":")
+            if (keyValuePair.size == 2) {
+                val letter = keyValuePair[0]
+                val numberText = keyValuePair[1]
+
+                // We swapped out "I" and "R" for "HR"
+                when (letter) {
+                    "T" -> temperatureF = numberText.toFloatOrNull() ?: 0.0f
+                    "P" -> pressurePa = numberText.toFloatOrNull() ?: 0.0f
+                    "HR" -> heartRateBpm = numberText.toIntOrNull() ?: 0
+                }
+            }
+        }
+
+        // Varibles ready to be put onto the screen.a
+        Log.d("XiaoBLE", "SUCCESSFULLY PARSED -> Temp: $temperatureF F, Press: $pressurePa Pa, BPM: $heartRateBpm")
+
+        // Todo: Send these variables to the UI (Screen) using LiveData, StateFlow, or a BroadcastReceiver!
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnectAll() {
+        Log.d("XiaoBLE", "Cleaning up all connections.")
+        activeGatts.values.forEach { it.disconnect() }
+        activeGatts.clear()
+        deviceBuffers.clear()
+    }
+}
