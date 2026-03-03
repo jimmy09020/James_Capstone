@@ -42,7 +42,7 @@ void setup() {
 
   Bluefruit.begin();
   Bluefruit.setTxPower(4); // Sets transmission power. The strongest setting in dBm for the nRF52840.
-  Bluefruit.setName("XIOA-Sensor 2"); // The unique name for the sensor.
+  Bluefruit.setName("XIAO-Sensor 2"); // The unique name for the sensor.
   
   Bluefruit.Periph.setConnectCallback(onDeviceConnected);
   Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
