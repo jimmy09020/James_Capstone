@@ -8,7 +8,7 @@ Adafruit_BMP280 bmp; // The class is Adafruit_BMP280 and the object is named bmp
 
 //--- TIMING Variables ---
 unsigned long lastTransmissionTime = 0;
-const long transmissionInterval = 1000; // Sending data every 1000 miliseconds (1 second). Using Const so XIOA will be told that this will not change when program is running.
+const long transmissionInterval = 1000; // Sending data every 1000 miliseconds (1 second). Using Const so XIAO will be told that this will not change when program is running.
 
 void setup() {
   Serial.begin(115200); // baud rate speed.
@@ -23,14 +23,14 @@ void setup() {
 
   Bluefruit.begin();
   Bluefruit.setTxPower(4); // Sets transmission power. The strongest setting in dBm for the nRF52840.
-  Bluefruit.setName("XIOA-Sensor 2"); // The unique name for the sensor.
+  Bluefruit.setName("XIAO-Sensor 2"); // The unique name for the sensor.
   
   Bluefruit.Periph.setConnectCallback(onDeviceConnected);
   Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
 
   bleuart.begin();
 
-  configureAdvertising(); // Custom function for the process where the XIOA is ready to be discovered to be connected.
+  configureAdvertising(); // Custom function for the process where the XIAO is ready to be discovered to be connected.
   Bluefruit.Advertising.start(0); // Fucntion from bluefruit library to talk to radio hardware. Set to 0 so that is is continously trying to be disccovered until connected.
 }
 
