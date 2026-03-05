@@ -1,0 +1,176 @@
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include "MAX30105.h" // SparkFun library used for MAX3010x series sensors (including the MAX30102).
+#include "heartRate.h" // SparkFun library algorithm to calculate Heart Rate.
+#include "spo2_algorithm.h" // SparkFun library algorithm to calculate Blood Oxygen
+
+BLEUart bleuart; 
+Adafruit_BMP280 bmp; 
+MAX30105 heartSensor; // The class is MAX30105 and the object is named heartSensor.
+
+unsigned long lastTransmissionTime = 0;
+const long transmissionInterval = 1000; 
+
+//--- HEART RATE Math Variables ---
+const byte RATE_SIZE = 8; // INCREASED from 4 to 8 for better smoothing and accuracy.
+byte rates[RATE_SIZE]; // Array to hold our past heart rates
+byte rateSpot = 0;
+long lastBeat = 0; // Time at which the last beat occurred
+float beatsPerMinute;
+int beatAvg; // The final smoothed Heart Rate we will send to the phone
+bool fingerOn = false; // Tracks if a finger is currently on the sensor
+
+//--- SPO2 Math Variables ---
+uint32_t irBuffer[100]; // infrared LED sensor data
+uint32_t redBuffer[100];  // red LED sensor data
+int32_t bufferLength = 100; // data length
+int32_t spo2 = 0; // SPO2 value
+int8_t validSPO2 = 0; // indicator to show if the SPO2 calculation is valid
+int32_t dummyHeartRate; // We won't use the Maxim HR, we'll keep your faster beatAvg
+int8_t dummyValidHR;
+byte bufferIndex = 0;
+int displaySpO2 = 0; // The final SpO2 value we will send to the phone
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Give the Serial Monitor 2 seconds to open so you don't miss startup errors
+  delay(2000); 
+  Serial.println("Starting Sensor Node Initialization...");
+
+  // 1. Initialize BMP280
+  if (!bmp.begin(0x76)) { 
+    Serial.println("BMP280 not found! Check wiring.");
+  } else {
+    Serial.println("BMP280 initialized successfully.");
+  }
+
+  // Initialize MAX30102 Sensor
+  if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) { // Starts the Max30102 Sesnor. I2C_Speed_Fast speeds up the communication to read pulse data faster.
+    Serial.println("Could not find MAX30102 sensor! Check wiring.");
+  } else {
+    Serial.println("MAX30102 initialized successfully.");
+    heartSensor.setup(); // Setting up MAX30102 sesnor with default settings.
+    
+    // REVERTED LED AMPLITUDE: 0x1F is the standard SparkFun value (~6.4mA).
+    // (Your absolute original default was 0x0A if you want to go even lower).
+    heartSensor.setPulseAmplitudeRed(0x1F); 
+    heartSensor.setPulseAmplitudeIR(0x1F);
+  }
+
+  // 2. Initialize Bluetooth
+  Bluefruit.begin();
+  Bluefruit.setName("XIAO-Sensor 1");
+  bleuart.begin();
+
+  // 3. Advertising
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+  
+  Serial.println("Setup complete. Reading sensors...");
+}
+
+void loop() {
+  // Constantly Reading Heart Sensor
+  heartSensor.check(); // Check the sensor, read up to 32 samples into the library's internal FIFO
+  
+  while (heartSensor.available()) {
+    redBuffer[bufferIndex] = heartSensor.getFIFORed();
+    irBuffer[bufferIndex] = heartSensor.getFIFOIR();
+    
+    long irValue = irBuffer[bufferIndex]; // Use this for your existing HR math
+
+    if (irValue > 20000) { // If IR value is above 20000, it means finger is on the sensor.
+      
+      if (fingerOn == false) {
+        // Finger was just placed! Reset the history so we don't calculate fake beats
+        fingerOn = true;
+        for (byte i = 0 ; i < RATE_SIZE ; i++) rates[i] = 0; // Clear the array
+        rateSpot = 0;
+        lastBeat = millis(); // Reset the clock
+        displaySpO2 = 0; // Reset SpO2
+        bufferIndex = 0; // Reset the SpO2 buffer to gather fresh data
+      }
+
+      if (checkForBeat(irValue) == true) { // checkForBeat() is a SparkFun math function for optical peak.
+        
+        long delta = millis() - lastBeat; // Once a beat is sensed, it figures out how long it took since last one.
+        lastBeat = millis();
+
+        beatsPerMinute = 60 / (delta / 1000.0); // Calculating the raw Beats Per Minute.
+
+        if (beatsPerMinute < 255 && beatsPerMinute > 20) { // Accepting normal heart rates to filter out bad data/glitches. 
+          rates[rateSpot++] = (byte)beatsPerMinute; // Stores reading in array to be smooth.
+          rateSpot %= RATE_SIZE; // Wrap around if we hit the limit
+
+          // Take average of the valid readings in the array
+          beatAvg = 0;
+          byte validBeats = 0;
+          for (byte x = 0 ; x < RATE_SIZE ; x++) {
+            if (rates[x] > 0) { // Only average array slots that actually have data
+              beatAvg += rates[x];
+              validBeats++;
+            }
+          }
+          if (validBeats > 0) {
+            beatAvg /= validBeats;
+          }
+        }
+      }
+    } 
+    else {
+      fingerOn = false; // Finger removed
+      beatAvg = 0; // If no finger is detected, heart rate set to 0.
+      displaySpO2 = 0; // Set SpO2 to 0
+    }
+
+    heartSensor.nextSample(); // Move to next sample in the internal FIFO
+    bufferIndex++;
+
+    if (bufferIndex == 100) {
+      // We have 100 samples! Calculate SpO2
+      if (fingerOn) {
+        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &dummyHeartRate, &dummyValidHR);
+        
+        if (validSPO2 == 1 && spo2 > 50 && spo2 <= 100) {
+          displaySpO2 = spo2; // Update the display value only if the math is confident
+        }
+      }
+
+      // Shift the last 75 samples to the beginning of the array to maintain a rolling window
+      for (byte i = 25; i < 100; i++) {
+        redBuffer[i - 25] = redBuffer[i];
+        irBuffer[i - 25] = irBuffer[i];
+      }
+      bufferIndex = 75; // Next readings will fill from index 75 to 99
+    }
+  }
+
+  // Handle Data Output (Every 1 Second)
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = currentMillis; // Reset the timer
+    
+    // READ BMP280 DATA
+    float realTempF = (bmp.readTemperature() * 1.8) + 32.0; 
+    
+    // READ PRESSURE (converted from Pascals to hPa / millibars)
+    float realPressure = bmp.readPressure() / 100.0F; 
+
+    // FORMAT: T:72.5,P:982.4,HR:75,SPO2:98
+    String packet = "T:" + String(realTempF, 1) + ",P:" + String(realPressure, 1) + ",HR:" + String(beatAvg) + ",SPO2:" + String(displaySpO2);
+    
+    // 1. ALWAYS print to Serial Monitor so you can test without a phone
+    Serial.println("Data: " + packet); 
+
+    // 2. ONLY send over Bluetooth if a device is actually connected
+    if (Bluefruit.connected()) {
+      bleuart.println(packet); 
+    }
+  }
+}
