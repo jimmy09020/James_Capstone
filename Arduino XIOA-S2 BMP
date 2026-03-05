@@ -1,129 +1,136 @@
-#include <bluefruit.h> //Library used for Bluetooth and how to talk to the chips "radio" inside the chip.
-#include <Wire.h> // Library for I2C communication (how the XIAO talks to the sensors).
-#include <Adafruit_Sensor.h> // library required for Adafruit sensors.
-#include <Adafruit_BMP280.h> // library used for the BMP280 sensor.
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
 #include "MAX30105.h" // SparkFun library used for MAX3010x series sensors (including the MAX30102).
 #include "heartRate.h" // SparkFun library algorithm to calculate Heart Rate.
 
-BLEUart bleuart; // Bluetooth Low Energy (BLE) is the class and the object is named bleuart.
-Adafruit_BMP280 bmp; // The class is Adafruit_BMP280 and the object is named bmp.
+BLEUart bleuart; 
+Adafruit_BMP280 bmp; 
 MAX30105 heartSensor; // The class is MAX30105 and the object is named heartSensor.
 
-//--- TIMING Variables ---
 unsigned long lastTransmissionTime = 0;
-const long transmissionInterval = 1000; // Sending data every 1000 miliseconds (1 second). Using Const so XIOA will be told that this will not change when program is running.
+const long transmissionInterval = 1000; 
 
 //--- HEART RATE Math Variables ---
-const byte RATE_SIZE = 4; // Increase this for more averaging. 4 is a good balance of speed/smoothness.
+const byte RATE_SIZE = 8; // INCREASED from 4 to 8 for better smoothing and accuracy.
 byte rates[RATE_SIZE]; // Array to hold our past heart rates
 byte rateSpot = 0;
 long lastBeat = 0; // Time at which the last beat occurred
 float beatsPerMinute;
 int beatAvg; // The final smoothed Heart Rate we will send to the phone
+byte beatsDetected = 0; // Tracks how many beats have happened since finger was placed
 
 void setup() {
-  Serial.begin(115200); // baud rate speed.
+  Serial.begin(115200);
   
-  pinMode(LED_BUILTIN, OUTPUT);
+  // Give the Serial Monitor 2 seconds to open so you don't miss startup errors
+  delay(2000); 
+  Serial.println("Starting Sensor Node Initialization...");
 
-  if (!bmp.begin(0x76)) { // Starts the BMP280 sensor. 0x76 is the cI2C adress for this stype of sensor modules.
-    Serial.println("Could not find BMP280 sensor!");
-    while (1); // Stop the program here if the sensor is not found.
+  // 1. Initialize BMP280
+  if (!bmp.begin(0x76)) { 
+    Serial.println("BMP280 not found! Check wiring.");
+  } else {
+    Serial.println("BMP280 initialized successfully.");
   }
 
+  // Initialize MAX30102 Sensor
   if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) { // Starts the Max30102 Sesnor. I2C_Speed_Fast speeds up the communication to read pulse data faster.
-    Serial.println("Could not find MAX30102 sensor!");
-    while (1); // Stop the program here if the sensor is not found.
+    Serial.println("Could not find MAX30102 sensor! Check wiring.");
+  } else {
+    Serial.println("MAX30102 initialized successfully.");
+    heartSensor.setup(); // Setting up MAX30102 sesnor with default settings.
+    
+    // INCREASED LED AMPLITUDE: 0x0A was too weak. 0x1F gives a much stronger signal to catch all beats.
+    heartSensor.setPulseAmplitudeRed(0x1F); 
+    heartSensor.setPulseAmplitudeIR(0x1F);
   }
-  
-  heartSensor.setup(); // Setting up MAX30102 sesnor with default settings.
-  heartSensor.setPulseAmplitudeRed(0x0A); // Brighness of the LED is turned down to save power.
-  heartSensor.setPulseAmplitudeIR(0x0A);
 
+  // 2. Initialize Bluetooth
   Bluefruit.begin();
-  Bluefruit.setTxPower(4); // Sets transmission power. The strongest setting in dBm for the nRF52840.
-  Bluefruit.setName("XIAO-Sensor 2"); // The unique name for the sensor.
-  
-  Bluefruit.Periph.setConnectCallback(onDeviceConnected);
-  Bluefruit.Periph.setDisconnectCallback(onDeviceDisconnected);
-
+  Bluefruit.setName("XIAO-Sensor 1");
   bleuart.begin();
 
-  configureAdvertising(); // Custom function for the process where the XIOA is ready to be discovered to be connected.
-  Bluefruit.Advertising.start(0); // Fucntion from bluefruit library to talk to radio hardware. Set to 0 so that is is continously trying to be disccovered until connected.
+  // 3. Advertising
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+  
+  Serial.println("Setup complete. Reading sensors...");
 }
 
-// Constantly Reading Heart Sesnor
-void loop(){
+void loop() {
+  // Constantly Reading Heart Sensor
+  long irValue = heartSensor.getIR(); // Read IR values as fast as possible to catch heartbeat peaks.
 
-  long irValue = heartSensor.getIR(); // Read IR values as fast as possible to catch hearbeat peaks.
-
-  if (irValue > 50000) { // If IR value is above 5000, it means finger is on the sesnor.
-    if (checkForBeat(irValue) == true) { // checkForbeat() is a SparkFun math function for optical peak.
-    
+  if (irValue > 20000) { // If IR value is above 20000, it means finger is on the sensor.
+    if (checkForBeat(irValue) == true) { // checkForBeat() is a SparkFun math function for optical peak.
+      
       long delta = millis() - lastBeat; // Once a beat is sensed, it figures out how long it took since last one.
       lastBeat = millis();
 
       beatsPerMinute = 60 / (delta / 1000.0); // Calculating the raw Beats Per Minute.
 
-      if (beatsPerMinute < 255 && beatsPerMinute > 20) { // Accepting normal heart rates to filter out bad data/glitches. 
-        rates[rateSpot++] = (byte)beatsPerMinute; // Stores reading in arrary to be smooth.
-        rateSpot %= RATE_SIZE; // Wrap around if we hit the limit
+      beatsDetected++; // Increment the beat counter
 
-        // Take average of the last few readings
-        beatAvg = 0;
-        for (byte x = 0 ; x < RATE_SIZE ; x++) {
-          beatAvg += rates[x];
+      // Ignore the first 2 physical peaks. Pressing your finger down squishes blood and causes false, slow beats!
+      if (beatsDetected > 2) {
+        if (beatsPerMinute < 255 && beatsPerMinute > 30) { // Accepting normal heart rates to filter out bad data/glitches. 
+          rates[rateSpot++] = (byte)beatsPerMinute; // Stores reading in array to be smooth.
+          rateSpot %= RATE_SIZE; // Wrap around if we hit the limit
+
+          // Take average of ONLY the valid readings
+          beatAvg = 0;
+          byte validBeats = 0;
+          for (byte x = 0 ; x < RATE_SIZE ; x++) {
+            if (rates[x] != 0) { // Only count slots that actually have data
+              beatAvg += rates[x];
+              validBeats++;
+            }
+          }
+          if (validBeats > 0) {
+            beatAvg /= validBeats; // Divide by the number of valid beats, not the fixed RATE_SIZE
+          }
         }
-        beatAvg /= RATE_SIZE;
       }
     }
   } 
   else {
-    beatAvg = 0; // If no finger is dected, heart rate set to 0.
+    beatAvg = 0; // If no finger is detected, heart rate set to 0.
+    beatsDetected = 0; // Reset the beat counter when finger is removed
+    lastBeat = millis(); // Constantly reset the timer so the first beat isn't artificially long
+    
+    // Clear the array and reset the counter so the next time a finger is placed, it starts fresh immediately!
+    for (byte x = 0 ; x < RATE_SIZE ; x++) {
+      rates[x] = 0; 
+    }
+    rateSpot = 0;
   }
 
-  if (millis() - lastTransmissionTime >= transmissionInterval) { // Checks to see if 1 second (1000 ms) has passed since last time data was sent.
-    lastTransmissionTime = millis(); // Update the timer to the current time
+  // Handle Data Output (Every 1 Second)
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = currentMillis; // Reset the timer
+    
+    // READ BMP280 DATA
+    float realTempF = (bmp.readTemperature() * 1.8) + 32.0; 
+    
+    // READ TRUE BAROMETRIC PRESSURE (in hPa). This fixes the negative numbers!
+    float realPressure = bmp.readPressure() / 100.0F; 
 
-    // Read the raw data from the BMP280 sensor
-    float tempCelsius = bmp.readTemperature(); // Sensor naturally reads in Celsius
-    float tempFahrenheit = (tempCelsius * 9.0 / 5.0) + 32.0; // Convert Celsius to Fahrenheit
-    float pressure = bmp.readPressure(); // Reads pressure in Pascals
+    // FORMAT: T:72.5,P:1012.3,HR:75
+    // Now 'P' actually stands for true Barometric Pressure instead of Altitude
+    String packet = "T:" + String(realTempF, 1) + ",P:" + String(realPressure, 1) + ",HR:" + String(beatAvg);
+    
+    // 1. ALWAYS print to Serial Monitor so you can test without a phone
+    Serial.println("Data: " + packet); 
 
-    // Serial montior to check for values are reading.
-    Serial.print("Temp: ");
-    Serial.print(tempFahrenheit);
-    Serial.print(" F, Pressure: ");
-    Serial.print(pressure);
-    Serial.print(" Pa, BPM: ");
-    Serial.println(beatAvg);
-
-    // Check if a phone (like your Android app) is actually connected right now
+    // 2. ONLY send over Bluetooth if a device is actually connected
     if (Bluefruit.connected()) {
-      // Send the data over Bluetooth to the phone
-      // The format will come out as "T:99.90,P:101325.00,HR:75"
-      bleuart.print("T:");
-      bleuart.print(tempFahrenheit);
-      bleuart.print(",P:");
-      bleuart.print(pressure);
-      bleuart.print(",HR:"); // HR stands for Heart Rate
-      bleuart.println(beatAvg); // println adds a newline at the end so the phone knows the message is done
+      bleuart.println(packet); 
     }
   }
-}
-
-void configureAdvertising(void) {
-  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addService(bleuart);
-  Bluefruit.ScanResponse.addName();
-  Bluefruit.Advertising.restartOnDisconnect(true);
-}
-
-void onDeviceConnected(uint16_t conn_handle) {
-  Serial.println("Phone connected!");
-}
-
-void onDeviceDisconnected(uint16_t conn_handle, uint8_t reason) {
-  Serial.println("Phone disconnected.");
 }
