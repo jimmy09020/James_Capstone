@@ -62,7 +62,7 @@ void setup() {
 
   // 2. Initialize Bluetooth
   Bluefruit.begin();
-  Bluefruit.setName("XIAO-Sensor 1");
+  Bluefruit.setName("XIAO-Sensor 2");
   bleuart.begin();
 
   // 3. Advertising
