@@ -1,0 +1,97 @@
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+
+// NOTE: All of these variables and functions should be placed inside 
+// your main Activity class or your Bluetooth Service class.
+
+// 1. The Global Buffer
+private var packetBuffer = StringBuilder()
+
+// 2. The BluetoothGattCallback
+private val gattCallback = object : BluetoothGattCallback() {
+
+    @Deprecated("Deprecated in API 33, but still used for older devices")
+    override fun onCharacteristicChanged(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+        super.onCharacteristicChanged(gatt, characteristic)
+        processIncomingData(characteristic.value)
+    }
+
+    // For Android 13+ (API 33+)
+    override fun onCharacteristicChanged(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray
+    ) {
+        super.onCharacteristicChanged(gatt, characteristic, value)
+        processIncomingData(value)
+    }
+}
+
+// 3. Buffer Processing Logic
+private fun processIncomingData(data: ByteArray) {
+    // Convert the raw bytes to a String
+    val chunk = String(data, Charsets.UTF_8)
+    packetBuffer.append(chunk)
+
+    // Check if we received the end of a line (\n)
+    val bufferString = packetBuffer.toString()
+    if (bufferString.contains("\n")) {
+        // Split the buffer by the newline character
+        val packets = bufferString.split("\n")
+
+        // The first item is our complete packet
+        val completePacket = packets[0].trim()
+        
+        // Send it to our parser
+        parseDataPacket(completePacket)
+
+        // Clear the buffer and keep any leftover partial data
+        packetBuffer.clear()
+        if (packets.size > 1) {
+            packetBuffer.append(packets[1])
+        }
+    }
+}
+
+// 4. Parsing and UI Update Logic
+private fun parseDataPacket(packet: String) {
+    if (packet.isEmpty()) return
+
+    // Run on the main UI thread to update the screen safely
+    // (If using a Service instead of an Activity, you would broadcast this data instead)
+    runOnUiThread {
+        
+        val dataPairs = packet.split(",")
+
+        for (pair in dataPairs) {
+            val parts = pair.split(":")
+            
+            if (parts.size == 2) {
+                val key = parts[0]
+                val value = parts[1]
+
+                when (key) {
+                    "HR" -> {
+                        val hr = value.toIntOrNull() ?: 0
+                        // Assuming you have a TextView named hrTextView
+                        hrTextView.text = if (hr > 0) hr.toString() else "--"
+                    }
+                    "SPO2" -> {
+                        val spo2 = value.toIntOrNull() ?: 0
+                        spo2TextView.text = if (spo2 > 0) spo2.toString() else "--"
+                    }
+                    "T" -> {
+                        tempTextView.text = value
+                    }
+                    "P" -> {
+                        pressureTextView.text = value
+                    }
+                }
+            }
+        }
+    }
+}
