@@ -1,0 +1,321 @@
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include "LSM6DS3.h"
+
+BLEUart bleuart;
+Adafruit_BMP280 bmp;
+MAX30105 heartSensor;
+LSM6DS3 myIMU(I2C_MODE, 0x6A);
+
+unsigned long lastTransmissionTime = 0;
+const long transmissionInterval = 1000;
+
+// ---------------- MASTER CLOCK VARIABLES ----------------
+unsigned long lastSyncBroadcastTime = 0;
+const long syncBroadcastInterval = 2000;
+
+// ---------------- HEART RATE VARIABLES ----------------
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute;
+int beatAvg;
+bool fingerOn = false;
+
+// ---------------- SPO2 VARIABLES ----------------
+uint32_t irBuffer[100];
+uint32_t redBuffer[100];
+int32_t bufferLength = 100;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t dummyHeartRate;
+int8_t dummyValidHR;
+byte bufferIndex = 0;
+int displaySpO2 = 0;
+
+// ---------------- ESTIMATED BLOOD PRESSURE VARIABLES ----------------
+// NOTE: This is a simple experimental estimate based on pulse amplitude.
+// It is NOT a true medical blood pressure measurement.
+float estimatedSBP = 0;
+float estimatedDBP = 0;
+float estimatedMAP = 0;
+float baselineSBP = 120.0;
+float baselineDBP = 80.0;
+
+// ---------------- ALTITUDE VARIABLES ----------------
+// Sea-level pressure used for altitude calculation.
+// Adjust this for your location/weather if needed.
+float seaLevelPressure_hPa = 1013.25;
+
+// ---------------- ACCELEROMETER VARIABLES ----------------
+float motionMagnitude = 0.0;
+String motionStatus = "Unknown";
+
+// ---------------- SYSTEM VARIABLES ----------------
+bool sensorError = false;
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+float calculatePulseAmplitude(uint32_t signalBuffer[], int length) {
+  uint32_t maxValue = 0;
+  uint32_t minValue = 0xFFFFFFFF;
+
+  for (int i = 0; i < length; i++) {
+    if (signalBuffer[i] > maxValue) maxValue = signalBuffer[i];
+    if (signalBuffer[i] < minValue) minValue = signalBuffer[i];
+  }
+
+  return (float)(maxValue - minValue);
+}
+
+void updateEstimatedBloodPressure() {
+  // Use IR waveform amplitude as a very simple feature.
+  // This is just to demonstrate how BP estimation could be added.
+  float pulseAmplitude = calculatePulseAmplitude(irBuffer, bufferLength);
+
+  // Simple placeholder model:
+  // Higher pulse amplitude nudges the estimate upward from a baseline.
+  // These constants would normally be found through calibration.
+  estimatedSBP = baselineSBP + (pulseAmplitude * 0.0008);
+  estimatedDBP = baselineDBP + (pulseAmplitude * 0.0004);
+
+  // Clamp to a reasonable display range for demo purposes.
+  if (estimatedSBP < 80) estimatedSBP = 80;
+  if (estimatedSBP > 180) estimatedSBP = 180;
+  if (estimatedDBP < 50) estimatedDBP = 50;
+  if (estimatedDBP > 120) estimatedDBP = 120;
+
+  estimatedMAP = estimatedDBP + ((estimatedSBP - estimatedDBP) / 3.0);
+}
+
+void updateMotionStatus(float accX, float accY, float accZ) {
+  // Use change from 1g as a simple motion estimate.
+  motionMagnitude = sqrt((accX * accX) + (accY * accY) + (accZ * accZ));
+  float motionDelta = fabs(motionMagnitude - 1.0);
+
+  if (motionDelta < 0.08) {
+    motionStatus = "Still";
+  } else if (motionDelta < 0.25) {
+    motionStatus = "Minor Motion";
+  } else {
+    motionStatus = "Active Motion";
+  }
+}
+
+void broadcastMasterTime(unsigned long masterTime) {
+  String syncPacket = "SYNC,MT:" + String(masterTime);
+
+  Serial.println("Master sync broadcast: " + syncPacket);
+
+  if (Bluefruit.connected()) {
+    bleuart.println(syncPacket);
+  }
+}
+
+void updateStatusLED() {
+  if (sensorError) {
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_BLUE, HIGH);
+    return;
+  }
+
+  if (Bluefruit.connected()) {
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_BLUE, HIGH);
+  } else {
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_BLUE, LOW);
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("Starting Sensor Node Initialization...");
+
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE, HIGH);
+
+  if (!bmp.begin(0x76)) {
+    Serial.println("BMP280 not found! Check wiring.");
+    sensorError = true;
+  } else {
+    Serial.println("BMP280 initialized successfully.");
+  }
+
+  if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("Could not find MAX30102 sensor! Check wiring.");
+    sensorError = true;
+  } else {
+    Serial.println("MAX30102 initialized successfully.");
+    heartSensor.setup();
+    heartSensor.setPulseAmplitudeRed(0x1F);
+    heartSensor.setPulseAmplitudeIR(0x1F);
+  }
+
+  if (myIMU.begin() != 0) {
+    Serial.println("LSM6DS3 not found!");
+    sensorError = true;
+  }
+
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.begin();
+  Bluefruit.setName("XIAO-Sensor 1");
+  bleuart.begin();
+
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+
+  updateStatusLED();
+
+  Serial.println("Setup complete. Master clock broadcasting enabled.");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+  heartSensor.check();
+
+  while (heartSensor.available()) {
+    redBuffer[bufferIndex] = heartSensor.getFIFORed();
+    irBuffer[bufferIndex] = heartSensor.getFIFOIR();
+
+    long irValue = irBuffer[bufferIndex];
+
+    if (irValue > 20000) {
+      if (fingerOn == false) {
+        fingerOn = true;
+        for (byte i = 0; i < RATE_SIZE; i++) rates[i] = 0;
+        rateSpot = 0;
+        lastBeat = millis();
+        displaySpO2 = 0;
+        bufferIndex = 0;
+      }
+
+      if (checkForBeat(irValue) == true) {
+        long delta = millis() - lastBeat;
+        lastBeat = millis();
+
+        beatsPerMinute = 60 / (delta / 1000.0);
+
+        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+          rates[rateSpot++] = (byte)beatsPerMinute;
+          rateSpot %= RATE_SIZE;
+
+          beatAvg = 0;
+          byte validBeats = 0;
+          for (byte x = 0; x < RATE_SIZE; x++) {
+            if (rates[x] > 0) {
+              beatAvg += rates[x];
+              validBeats++;
+            }
+          }
+          if (validBeats > 0) {
+            beatAvg /= validBeats;
+          }
+        }
+      }
+    } else {
+      fingerOn = false;
+      beatAvg = 0;
+      displaySpO2 = 0;
+    }
+
+    heartSensor.nextSample();
+    bufferIndex++;
+
+    if (bufferIndex == 100) {
+      if (fingerOn) {
+        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &dummyHeartRate, &dummyValidHR);
+
+        if (validSPO2 == 1 && spo2 > 50 && spo2 <= 100) {
+          displaySpO2 = spo2;
+        }
+
+        // Update experimental blood pressure estimate from the waveform window.
+        updateEstimatedBloodPressure();
+      }
+
+      // Sliding window: keep last 75 samples
+      for (byte i = 25; i < 100; i++) {
+        redBuffer[i - 25] = redBuffer[i];
+        irBuffer[i - 25] = irBuffer[i];
+      }
+      bufferIndex = 75;
+    }
+  }
+
+    unsigned long currentMillis = millis();
+
+  // Broadcast master time every few seconds
+  if (currentMillis - lastSyncBroadcastTime >= syncBroadcastInterval) {
+    lastSyncBroadcastTime = currentMillis;
+    broadcastMasterTime(currentMillis);
+  }
+
+  // Send one packet every second
+  if (currentMillis - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = currentMillis;
+
+    updateStatusLED();
+
+    float realTempF = (bmp.readTemperature() * 1.8) + 32.0;
+    float realPressure = bmp.readPressure() / 100.0F;
+    float realAlt = bmp.readAltitude(seaLevelPressure_hPa);
+    float accX = myIMU.readFloatAccelX();
+    float accY = myIMU.readFloatAccelY();
+    float accZ = myIMU.readFloatAccelZ();
+
+    updateMotionStatus(accX, accY, accZ);
+
+    String packet =
+      "T:" + String(realTempF, 1) +
+      ",P:" + String(realPressure, 1) +
+      ",ALT:" + String(realAlt, 1) +
+      ",HR:" + String(beatAvg) +
+      ",SPO2:" + String(displaySpO2) +
+      ",SBP:" + String(estimatedSBP, 1) +
+      ",DBP:" + String(estimatedDBP, 1);
+      ",MOTION:" + motionStatus;
+
+    Serial.println("Data: " + packet);
+
+    if (Bluefruit.connected()) {
+  bleuart.print("T:" + String(realTempF, 1));
+  bleuart.print(",P:" + String(realPressure, 1));
+  bleuart.print(",ALT:" + String(realAlt, 1));
+  bleuart.print(",HR:" + String(beatAvg));
+  bleuart.print(",SPO2:" + String(displaySpO2));
+  bleuart.print(",SBP:" + String(estimatedSBP, 1));
+  bleuart.print(",DBP:" + String(estimatedDBP, 1));
+  bleuart.println(",MOTION:" + motionStatus);
+
+    }
+  }
+}
+
