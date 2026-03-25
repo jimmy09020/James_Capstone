@@ -1,0 +1,429 @@
+
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
+
+enum class BleConnectionState {
+    DISCONNECTED,
+    CONNECTING,
+    CONNECTED
+}
+
+data class DiscoveredBleDevice(
+    val name: String,
+    val address: String,
+    val rssi: Int,
+    val device: BluetoothDevice
+)
+
+data class SensorPacket(
+    val sourceAddress: String,
+    val sourceName: String? = null,
+    val raw: String,
+    val temperature: Float? = null,
+    val pressure: Float? = null,
+    val altitude: Float? = null,
+    val heartRate: Int? = null,
+    val spo2: Int? = null,
+    val systolicBp: Float? = null,
+    val diastolicBp: Float? = null,
+    val motion: String? = null
+)
+
+class MultiXiaoBleBridge(private val context: Context) {
+
+    companion object {
+        private const val TAG = "MultiXiaoBleBridge"
+
+        private val XIAO_SERVICE_UUID =
+            UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+
+        private val XIAO_NOTIFY_CHAR_UUID =
+            UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+
+        private val CLIENT_CHARACTERISTIC_CONFIG_UUID =
+            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    }
+
+    private val bluetoothManager =
+        context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+
+    private val bluetoothAdapter = bluetoothManager.adapter
+    private val scanner get() = bluetoothAdapter?.bluetoothLeScanner
+
+    // One GATT per device
+    private val gatts = mutableMapOf<String, BluetoothGatt>()
+
+    // One message buffer per device
+    private val deviceBuffers = mutableMapOf<String, StringBuilder>()
+
+    // Optional: remember latest discovered device object by address
+    private val discoveredDevices = mutableMapOf<String, BluetoothDevice>()
+
+    // Optional: remember display names
+    private val deviceNames = mutableMapOf<String, String>()
+
+    // Track connection state per address
+    private val _connectionStates =
+        MutableStateFlow<Map<String, BleConnectionState>>(emptyMap())
+    val connectionStates: StateFlow<Map<String, BleConnectionState>> =
+        _connectionStates.asStateFlow()
+
+    // Latest packet per address
+    private val _latestPackets =
+        MutableStateFlow<Map<String, SensorPacket>>(emptyMap())
+    val latestPackets: StateFlow<Map<String, SensorPacket>> =
+        _latestPackets.asStateFlow()
+
+    // Stream of discovered devices
+    private val _scanResults =
+        MutableSharedFlow<DiscoveredBleDevice>(extraBufferCapacity = 64)
+    val scanResults: SharedFlow<DiscoveredBleDevice> = _scanResults.asSharedFlow()
+
+    // Stream of parsed packets from all devices
+    private val _packetEvents =
+        MutableSharedFlow<SensorPacket>(extraBufferCapacity = 128)
+    val packetEvents: SharedFlow<SensorPacket> = _packetEvents.asSharedFlow()
+
+    private var internalScanCallback: ScanCallback? = null
+
+    @SuppressLint("MissingPermission")
+    fun startScan() {
+        if (bluetoothAdapter?.isEnabled != true) {
+            Log.w(TAG, "Bluetooth is off")
+            return
+        }
+
+        if (internalScanCallback != null) {
+            Log.d(TAG, "Scan already running")
+            return
+        }
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val device = result.device
+                val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown XIAO"
+
+                if (name.contains("XIAO", ignoreCase = true)) {
+                    discoveredDevices[device.address] = device
+                    deviceNames[device.address] = name
+
+                    _scanResults.tryEmit(
+                        DiscoveredBleDevice(
+                            name = name,
+                            address = device.address,
+                            rssi = result.rssi,
+                            device = device
+                        )
+                    )
+
+                    Log.d(TAG, "Found XIAO: $name ${device.address}")
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.e(TAG, "Scan failed: $errorCode")
+            }
+        }
+
+        internalScanCallback = callback
+        scanner?.startScan(null, settings, callback)
+        Log.d(TAG, "BLE scan started")
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopScan() {
+        val callback = internalScanCallback ?: return
+        scanner?.stopScan(callback)
+        internalScanCallback = null
+        Log.d(TAG, "BLE scan stopped")
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice) {
+        val address = device.address
+
+        if (gatts.containsKey(address)) {
+            Log.d(TAG, "Already connected/connecting to $address")
+            return
+        }
+
+        discoveredDevices[address] = device
+        deviceNames[address] = device.name ?: deviceNames[address] ?: "XIAO"
+
+        updateConnectionState(address, BleConnectionState.CONNECTING)
+        deviceBuffers[address] = StringBuilder()
+
+        val gatt = device.connectGatt(context, false, createGattCallback())
+        gatts[address] = gatt
+
+        Log.d(TAG, "Connecting to ${device.address}")
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect(address: String) {
+        gatts[address]?.disconnect()
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnectAll() {
+        gatts.keys.toList().forEach { address ->
+            gatts[address]?.disconnect()
+        }
+    }
+
+    fun isConnected(address: String): Boolean {
+        return _connectionStates.value[address] == BleConnectionState.CONNECTED
+    }
+
+    fun getConnectedAddresses(): List<String> {
+        return _connectionStates.value
+            .filterValues { it == BleConnectionState.CONNECTED }
+            .keys
+            .toList()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createGattCallback(): BluetoothGattCallback {
+        return object : BluetoothGattCallback() {
+
+            override fun onConnectionStateChange(
+                gatt: BluetoothGatt,
+                status: Int,
+                newState: Int
+            ) {
+                val address = gatt.device.address
+
+                Log.d(
+                    TAG,
+                    "onConnectionStateChange address=$address status=$status newState=$newState"
+                )
+
+                when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        updateConnectionState(address, BleConnectionState.CONNECTED)
+
+                        val mtuRequested = gatt.requestMtu(185)
+                        Log.d(TAG, "Requested MTU 185 for $address -> $mtuRequested")
+
+                        if (!mtuRequested) {
+                            Log.w(TAG, "MTU request failed immediately for $address")
+                            gatt.discoverServices()
+                        }
+                    }
+
+                    BluetoothProfile.STATE_DISCONNECTED -> {
+                        Log.d(TAG, "Disconnected: $address")
+
+                        updateConnectionState(address, BleConnectionState.DISCONNECTED)
+                        deviceBuffers.remove(address)
+
+                        val knownGatt = gatts.remove(address)
+                        if (knownGatt != null) {
+                            knownGatt.close()
+                        } else {
+                            gatt.close()
+                        }
+
+                        val updatedPackets = _latestPackets.value.toMutableMap()
+                        updatedPackets.remove(address)
+                        _latestPackets.value = updatedPackets
+                    }
+                }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                Log.d(TAG, "onMtuChanged address=${gatt.device.address} mtu=$mtu status=$status")
+                gatt.discoverServices()
+            }
+
+            @SuppressLint("MissingPermission")
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                val address = gatt.device.address
+                Log.d(TAG, "onServicesDiscovered address=$address status=$status")
+
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.e(TAG, "Service discovery failed for $address")
+                    return
+                }
+
+                val service = gatt.getService(XIAO_SERVICE_UUID)
+                if (service == null) {
+                    Log.e(TAG, "UART service not found for $address")
+                    return
+                }
+
+                val notifyChar = service.getCharacteristic(XIAO_NOTIFY_CHAR_UUID)
+                if (notifyChar == null) {
+                    Log.e(TAG, "Notify characteristic not found for $address")
+                    return
+                }
+
+                val notificationEnabled =
+                    gatt.setCharacteristicNotification(notifyChar, true)
+                Log.d(TAG, "setCharacteristicNotification for $address -> $notificationEnabled")
+
+                val descriptor =
+                    notifyChar.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+
+                if (descriptor == null) {
+                    Log.e(TAG, "CCC descriptor not found for $address")
+                    return
+                }
+
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                val started = gatt.writeDescriptor(descriptor)
+                Log.d(TAG, "writeDescriptor started for $address -> $started")
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic
+            ) {
+                if (characteristic.uuid != XIAO_NOTIFY_CHAR_UUID) return
+
+                val rawBytes = characteristic.value ?: return
+                val address = gatt.device.address
+                val name = deviceNames[address]
+                val chunk = String(rawBytes, Charsets.UTF_8)
+
+                Log.d(TAG, "BLE chunk from $address -> [$chunk]")
+
+                handleIncomingChunk(
+                    address = address,
+                    sourceName = name,
+                    chunk = chunk
+                )
+            }
+        }
+    }
+
+    private fun handleIncomingChunk(
+        address: String,
+        sourceName: String?,
+        chunk: String
+    ) {
+        val buffer = deviceBuffers.getOrPut(address) { StringBuilder() }
+        buffer.append(chunk)
+
+        while (buffer.contains("\n")) {
+            val newlineIndex = buffer.indexOf("\n")
+            val completeMessage = buffer.substring(0, newlineIndex).trim()
+            buffer.delete(0, newlineIndex + 1)
+
+            if (completeMessage.isEmpty()) continue
+
+            if (completeMessage.startsWith("SYNC")) {
+                Log.d(TAG, "Ignoring SYNC from $address -> $completeMessage")
+                continue
+            }
+
+            Log.d(TAG, "Complete packet from $address -> $completeMessage")
+
+            val parsed = parsePacket(
+                sourceAddress = address,
+                sourceName = sourceName,
+                rawString = completeMessage
+            ) ?: continue
+
+            val updated = _latestPackets.value.toMutableMap()
+            updated[address] = parsed
+            _latestPackets.value = updated
+
+            _packetEvents.tryEmit(parsed)
+        }
+    }
+
+    private fun parsePacket(
+        sourceAddress: String,
+        sourceName: String?,
+        rawString: String
+    ): SensorPacket? {
+        return try {
+            var temp: Float? = null
+            var press: Float? = null
+            var alt: Float? = null
+            var hr: Int? = null
+            var spo2: Int? = null
+            var sbp: Float? = null
+            var dbp: Float? = null
+            var motion: String? = null
+
+            val components = rawString.removePrefix("$").split(",")
+
+            for (item in components) {
+                val parts = item.split(":", limit = 2)
+                if (parts.size < 2) continue
+
+                val key = parts[0].trim().uppercase()
+                val value = parts[1].trim()
+
+                when (key) {
+                    "T" -> temp = value.toFloatOrNull()
+                    "P" -> press = value.toFloatOrNull()
+                    "ALT" -> alt = value.toFloatOrNull()
+                    "HR" -> hr = value.toIntOrNull()
+                    "SPO2" -> spo2 = value.toIntOrNull()
+                    "SBP" -> sbp = value.toFloatOrNull()
+                    "DBP" -> dbp = value.toFloatOrNull()
+                    "MOTION" -> motion = value
+                }
+            }
+
+            SensorPacket(
+                sourceAddress = sourceAddress,
+                sourceName = sourceName,
+                raw = rawString,
+                temperature = temp,
+                pressure = press,
+                altitude = alt,
+                heartRate = hr,
+                spo2 = spo2,
+                systolicBp = sbp,
+                diastolicBp = dbp,
+                motion = motion
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Parse failed for $sourceAddress -> $rawString", e)
+            null
+        }
+    }
+
+    private fun updateConnectionState(address: String, state: BleConnectionState) {
+        val updated = _connectionStates.value.toMutableMap()
+        updated[address] = state
+        _connectionStates.value = updated
+    }
+
+    fun cleanup() {
+        disconnectAll()
+        gatts.values.forEach { it.close() }
+        gatts.clear()
+        deviceBuffers.clear()
+        stopScan()
+        _connectionStates.value = emptyMap()
+        _latestPackets.value = emptyMap()
+    }
+}
