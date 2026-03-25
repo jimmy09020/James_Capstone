@@ -27,7 +27,7 @@ long lastBeat = 0;
 float beatsPerMinute;
 int beatAvg;
 int displayHR = 0;
-const int hrOffset = 7;
+const int hrOffset = 5;
 bool fingerOn = false;
 int noFingerCounter = 0;
 int rejectedBeatsCounter = 0;
@@ -58,7 +58,7 @@ float prevAccX = 0, prevAccY = 0, prevAccZ = 0;
 float accumulatedMotion = 0.0;
 int motionSampleCount = 0;
 unsigned long lastImuReadTime = 0;
-const long imuReadInterval = 50;
+const long imuReadInterval = 20; // Increased sampling frequency (from 50ms to 20ms)
 String motionStatus = "Unknown";
 
 // ---------------- SYSTEM VARIABLES ----------------
@@ -105,10 +105,12 @@ void sampleIMU() {
     return;
   }
 
+  // Calculate change in G-force across all axes
   float deltaX = accX - prevAccX;
   float deltaY = accY - prevAccY;
   float deltaZ = accZ - prevAccZ;
 
+  // Magnitude of the vector change
   float instMotion = sqrt((deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ));
 
   accumulatedMotion += instMotion;
@@ -127,9 +129,15 @@ void evaluateMotionStatus() {
   accumulatedMotion = 0.0;
   motionSampleCount = 0;
 
-  if (avgMotion < 0.03) {
+  /**
+   * REFINED THRESHOLDS:
+   * < 0.015: Still (stationary)
+   * 0.015 - 0.25: Minor motion (Walking, rhythmic up/down movement)
+   * > 0.25: Active motion (Running, rapid shaking)
+   */
+  if (avgMotion < 0.015) {
     motionStatus = "Still";
-  } else if (avgMotion < 0.20) {
+  } else if (avgMotion < 0.25) {
     motionStatus = "Minor Motion";
   } else {
     motionStatus = "Active Motion";
@@ -207,7 +215,7 @@ void setup() {
 
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin();
-  Bluefruit.setName("XIAO-Sensor 2");
+  Bluefruit.setName("XIAO-Sensor 1");
   bleuart.begin();
 
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
