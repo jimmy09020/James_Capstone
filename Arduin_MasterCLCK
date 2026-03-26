@@ -27,10 +27,17 @@ long lastBeat = 0;
 float beatsPerMinute;
 int beatAvg;
 int displayHR = 0;
-const int hrOffset = 5;
+const int hrOffset = 4;
 bool fingerOn = false;
 int noFingerCounter = 0;
 int rejectedBeatsCounter = 0;
+int stabilizationCounter = 0; 
+unsigned long fingerTouchTime = 0; 
+
+// --- SLOW UPDATE LOGIC ---
+unsigned long lastDisplayUpdateTime = 0;
+const long displayUpdateInterval = 3000; // Update the BPM every 3 seconds
+int pendingHR = 0; 
 
 // ---------------- SPO2 VARIABLES ----------------
 uint32_t irBuffer[100];
@@ -58,7 +65,7 @@ float prevAccX = 0, prevAccY = 0, prevAccZ = 0;
 float accumulatedMotion = 0.0;
 int motionSampleCount = 0;
 unsigned long lastImuReadTime = 0;
-const long imuReadInterval = 20; // Increased sampling frequency (from 50ms to 20ms)
+const long imuReadInterval = 20; 
 String motionStatus = "Unknown";
 
 // ---------------- SYSTEM VARIABLES ----------------
@@ -82,7 +89,15 @@ float calculatePulseAmplitude(uint32_t signalBuffer[], int length) {
 }
 
 void updateEstimatedBloodPressure() {
+  if (!fingerOn || (millis() - fingerTouchTime < 1500) || stabilizationCounter < 4) {
+    estimatedSBP = 0;
+    estimatedDBP = 0;
+    return;
+  }
+
   float pulseAmplitude = calculatePulseAmplitude(irBuffer, bufferLength);
+
+  if (pulseAmplitude > 50000) return;
 
   estimatedSBP = baselineSBP + (pulseAmplitude * 0.0008);
   estimatedDBP = baselineDBP + (pulseAmplitude * 0.0004);
@@ -105,12 +120,10 @@ void sampleIMU() {
     return;
   }
 
-  // Calculate change in G-force across all axes
   float deltaX = accX - prevAccX;
   float deltaY = accY - prevAccY;
   float deltaZ = accZ - prevAccZ;
 
-  // Magnitude of the vector change
   float instMotion = sqrt((deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ));
 
   accumulatedMotion += instMotion;
@@ -129,12 +142,6 @@ void evaluateMotionStatus() {
   accumulatedMotion = 0.0;
   motionSampleCount = 0;
 
-  /**
-   * REFINED THRESHOLDS:
-   * < 0.015: Still (stationary)
-   * 0.015 - 0.25: Minor motion (Walking, rhythmic up/down movement)
-   * > 0.25: Active motion (Running, rapid shaking)
-   */
   if (avgMotion < 0.015) {
     motionStatus = "Still";
   } else if (avgMotion < 0.25) {
@@ -146,9 +153,6 @@ void evaluateMotionStatus() {
 
 void broadcastMasterTime(unsigned long masterTime) {
   String syncPacket = "SYNC,MT:" + String(masterTime);
-
-  Serial.println("Master sync broadcast: " + syncPacket);
-
   if (Bluefruit.connected()) {
     bleuart.println(syncPacket);
   }
@@ -179,7 +183,7 @@ void updateStatusLED() {
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("Starting Sensor Node Initialization...");
+  Serial.println("System Initializing...");
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
@@ -190,27 +194,22 @@ void setup() {
   digitalWrite(LED_BLUE, HIGH);
 
   if (!bmp.begin(0x76)) {
-    Serial.println("BMP280 not found! Check wiring.");
+    Serial.println("BMP280 Error");
     sensorError = true;
-  } else {
-    Serial.println("BMP280 initialized successfully.");
   }
 
   if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("Could not find MAX30102 sensor! Check wiring.");
+    Serial.println("MAX30105 Error");
     sensorError = true;
   } else {
-    Serial.println("MAX30102 initialized successfully.");
-    heartSensor.setup();
-    heartSensor.setPulseAmplitudeRed(0x1F);
-    heartSensor.setPulseAmplitudeIR(0x1F);
+    heartSensor.setup(); 
+    heartSensor.setPulseAmplitudeRed(0x1F); 
+    heartSensor.setPulseAmplitudeIR(0x1F);  
   }
 
   if (myIMU.begin() != 0) {
-    Serial.println("LSM6DS3 not found!");
+    Serial.println("IMU Error");
     sensorError = true;
-  } else {
-    Serial.println("LSM6DS3 initialized successfully.");
   }
 
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
@@ -225,8 +224,7 @@ void setup() {
   Bluefruit.Advertising.start(0);
 
   updateStatusLED();
-
-  Serial.println("Setup complete. Reading sensors...");
+  Serial.println("Setup Complete");
 }
 
 // ============================================================
@@ -242,19 +240,32 @@ void loop() {
 
     long irValue = irBuffer[bufferIndex];
 
-    if (irValue > 20000) {
+    if (irValue > 30000) { 
       noFingerCounter = 0;
 
       if (fingerOn == false) {
         fingerOn = true;
+        fingerTouchTime = millis(); 
+        lastDisplayUpdateTime = millis(); // Reset update timer
         for (byte i = 0 ; i < RATE_SIZE ; i++) rates[i] = 0;
         rateSpot = 0;
         lastBeat = millis();
         displaySpO2 = 0;
         displayHR = 0;
+        pendingHR = 0;
+        estimatedSBP = 0;
+        estimatedDBP = 0;
         bufferIndex = 0;
         beatAvg = 0;
         rejectedBeatsCounter = 0;
+        stabilizationCounter = 0;
+      }
+
+      if (millis() - fingerTouchTime < 1500) {
+        heartSensor.nextSample();
+        bufferIndex++;
+        if (bufferIndex == 100) bufferIndex = 0;
+        continue;
       }
 
       if (checkForBeat(irValue) == true) {
@@ -263,8 +274,16 @@ void loop() {
 
         beatsPerMinute = 60 / (delta / 1000.0);
 
-        if (beatsPerMinute <= 180 && beatsPerMinute >= 40) {
-          if (beatAvg == 0 || abs((int)beatsPerMinute - beatAvg) <= 30) {
+        if (stabilizationCounter < 4) {
+          stabilizationCounter++;
+          continue; 
+        }
+
+        // Noise gate
+        if (millis() - fingerTouchTime < 8000 && beatsPerMinute > 108) continue;
+
+        if (beatsPerMinute <= 150 && beatsPerMinute >= 45) {
+          if (beatAvg == 0 || abs((int)beatsPerMinute - beatAvg) <= 25) {
             rejectedBeatsCounter = 0;
 
             rates[rateSpot++] = (byte)beatsPerMinute;
@@ -280,20 +299,14 @@ void loop() {
             }
             if (validBeats > 0) {
               beatAvg /= validBeats;
-
-              if (displayHR == 0) {
-                displayHR = beatAvg;
-              } else {
-                displayHR = (beatAvg * 0.2) + (displayHR * 0.8);
-              }
+              
+              // Instead of updating displayHR directly, we store the calculation
+              pendingHR = beatAvg;
             }
           } else {
             rejectedBeatsCounter++;
-
-            if (rejectedBeatsCounter >= 3) {
-              for (byte i = 0 ; i < RATE_SIZE ; i++) rates[i] = (byte)beatsPerMinute;
-              beatAvg = (int)beatsPerMinute;
-              displayHR = beatAvg;
+            if (rejectedBeatsCounter >= 4) {
+              beatAvg = 0; 
               rejectedBeatsCounter = 0;
             }
           }
@@ -302,11 +315,16 @@ void loop() {
     }
     else {
       noFingerCounter++;
-      if (noFingerCounter > 50) {
+      displayHR = 0;
+      pendingHR = 0;
+      displaySpO2 = 0;
+      estimatedSBP = 0;
+      estimatedDBP = 0;
+      stabilizationCounter = 0;
+
+      if (noFingerCounter > 15) { 
         fingerOn = false;
         beatAvg = 0;
-        displayHR = 0;
-        displaySpO2 = 0;
       }
     }
 
@@ -314,13 +332,9 @@ void loop() {
     bufferIndex++;
 
     if (bufferIndex == 100) {
-      if (fingerOn) {
+      if (fingerOn && (millis() - fingerTouchTime > 1500) && stabilizationCounter >= 4) {
         maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &maximHeartRate, &maximValidHR);
-
-        if (validSPO2 == 1 && spo2 > 50 && spo2 <= 100) {
-          displaySpO2 = spo2;
-        }
-
+        if (validSPO2 == 1 && spo2 > 88 && spo2 <= 100) displaySpO2 = spo2;
         updateEstimatedBloodPressure();
       }
 
@@ -334,6 +348,23 @@ void loop() {
 
   unsigned long currentMillis = millis();
 
+  // --- STEPPED DISPLAY UPDATE ---
+  // Only update the actual HR shown every 3 seconds to prevent "frozen" or "jittery" feel
+  if (fingerOn && stabilizationCounter >= 4) {
+    if (currentMillis - lastDisplayUpdateTime >= displayUpdateInterval) {
+      lastDisplayUpdateTime = currentMillis;
+      
+      if (pendingHR > 0) {
+        // Apply a small smoothing step toward the pending HR
+        if (displayHR == 0) displayHR = pendingHR;
+        else {
+            // Move by roughly 1/2 the distance to the target for a smooth feel
+            displayHR = (pendingHR * 0.5) + (displayHR * 0.5);
+        }
+      }
+    }
+  }
+
   if (currentMillis - lastImuReadTime >= imuReadInterval) {
     lastImuReadTime = currentMillis;
     sampleIMU();
@@ -346,17 +377,15 @@ void loop() {
 
   if (currentMillis - lastTransmissionTime >= transmissionInterval) {
     lastTransmissionTime = currentMillis;
-
     updateStatusLED();
 
     float realTempF = (bmp.readTemperature() * 1.8) + 32.0;
     float realPressure = bmp.readPressure() / 100.0F;
     float realAlt = bmp.readAltitude(seaLevelPressure_hPa);
-
     evaluateMotionStatus();
 
     int finalHR = 0;
-    if (displayHR > 0) {
+    if (displayHR > 0 && stabilizationCounter >= 4) {
       finalHR = displayHR + hrOffset;
     }
 
@@ -370,17 +399,7 @@ void loop() {
       ",DBP:" + String(estimatedDBP, 1) +
       ",MOTION:" + motionStatus;
 
-    Serial.println("Data: " + packet);
-
-    if (Bluefruit.connected()) {
-      bleuart.print("T:" + String(realTempF, 1));
-      bleuart.print(",P:" + String(realPressure, 1));
-      bleuart.print(",ALT:" + String(realAlt, 1));
-      bleuart.print(",HR:" + String(finalHR));
-      bleuart.print(",SPO2:" + String(displaySpO2));
-      bleuart.print(",SBP:" + String(estimatedSBP, 1));
-      bleuart.print(",DBP:" + String(estimatedDBP, 1));
-      bleuart.println(",MOTION:" + motionStatus);
-    }
+    Serial.println(packet);
+    if (Bluefruit.connected()) bleuart.println(packet);
   }
 }
