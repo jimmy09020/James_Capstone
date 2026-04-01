@@ -1,0 +1,548 @@
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include "LSM6DS3.h"
+
+// ============================================================
+// PERIPHERAL INSTANCES
+// ============================================================
+BLEUart bleuart;
+Adafruit_BMP280 bmp;
+MAX30105 heartSensor;
+LSM6DS3 myIMU(I2C_MODE, 0x6A);
+
+// ============================================================
+// TIMING
+// ============================================================
+unsigned long lastTransmissionTime  = 0;
+unsigned long lastSyncBroadcastTime = 0;
+unsigned long lastImuReadTime       = 0;
+
+const long transmissionInterval  = 500;
+const long syncBroadcastInterval = 2000;
+const long imuReadInterval       = 20;
+
+// ============================================================
+// HEART RATE
+// ============================================================
+const int   BPM_BUF_SIZE = 5;
+const float BPM_LOW      = 40.0;
+const float BPM_HIGH     = 180.0;
+
+const int HR_MAX_JUMP_STABLE  = 15;
+const int HR_REACQ_AGREE      = 15;
+const int HR_COLD_LOCK_COUNT  = 3;
+const int HR_SEED_LOCK_COUNT  = 2;
+const int HR_SEED_GATE        = 20;
+const int HR_STUCK_LIMIT      = 6;
+
+const unsigned long HR_STALE_MS = 30000UL;
+
+const int HR_PASSTHROUGH_BAND = 8;   // BPM — natural variation passes freely
+const int HR_SMOOTH_STEP      = 5;   // BPM/sec ramp for large jumps only
+
+int smoothedHR = 0;
+
+float bpmBuffer[BPM_BUF_SIZE];
+int   bpmBufIdx   = 0;
+int   bpmBufCount = 0;
+
+long  lastBeatMs  = 0;
+int   displayHR   = 0;
+int   lastKnownHR = 0;
+
+unsigned long fingerOffTime = 0;
+
+bool reacqMode       = true;
+int  reacqLastBeat   = 0;
+int  reacqAgreeCount = 0;
+int  stuckCounter    = 0;
+
+bool fingerOn        = false;
+int  noFingerCounter = 0;
+
+unsigned long fingerOnTime    = 0;
+const unsigned long WARMUP_MS = 500;
+bool warmupDone = false;
+
+// ============================================================
+// SPO2
+// ============================================================
+const int32_t SPO2_BUFFER_LEN = 100;
+const byte    SPO2_SHIFT      = 25;
+
+uint32_t irBuffer[SPO2_BUFFER_LEN];
+uint32_t redBuffer[SPO2_BUFFER_LEN];
+int32_t  spo2           = 0;
+int8_t   validSPO2      = 0;
+int32_t  maximHeartRate = 0;
+int8_t   maximValidHR   = 0;
+byte     bufferIndex    = 0;
+int      displaySpO2    = 0;
+
+bool spo2WarmupDone       = false;
+int  spo2ConsecutiveValid = 0;
+const int SPO2_CONFIRM_COUNT = 2;
+
+// ============================================================
+// ENVIRONMENT (BMP280)
+// ============================================================
+float seaLevelPressure_hPa = 1013.25;
+
+// ============================================================
+// ACCELEROMETER / MOTION
+// ============================================================
+float  accumulatedGyro   = 0.0;
+float  accMagSum         = 0.0;
+float  accMagSqSum       = 0.0;
+int    motionSampleCount = 0;
+String motionStatus      = "Unknown";
+
+const float GYRO_STILL_THRESHOLD   = 15.0;
+const float GYRO_ACTIVE_THRESHOLD  = 80.0;
+const float ACC_VARIANCE_THRESHOLD = 0.01;
+
+// ============================================================
+// SYSTEM
+// ============================================================
+bool sensorError = false;
+
+
+// ============================================================
+// MEDIAN FILTER
+// ============================================================
+
+float getMedianBPM() {
+  int n = (bpmBufCount < BPM_BUF_SIZE) ? bpmBufCount : BPM_BUF_SIZE;
+  float sorted[BPM_BUF_SIZE];
+  for (int i = 0; i < n; i++) sorted[i] = bpmBuffer[i];
+
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        float tmp     = sorted[j];
+        sorted[j]     = sorted[j + 1];
+        sorted[j + 1] = tmp;
+      }
+    }
+  }
+  return sorted[n / 2];
+}
+
+
+void updateSmoothedHR() {
+  // Finger off — snap to 0 immediately
+  if (displayHR == 0) {
+    smoothedHR = 0;
+    return;
+  }
+
+  // First reading after lock-on — seed immediately so app
+  // doesn't sit at 0 for several cycles
+  if (smoothedHR == 0) {
+    smoothedHR = displayHR;
+    return;
+  }
+
+  int diff = displayHR - smoothedHR;
+  int absDiff = abs(diff);
+
+  if (absDiff <= HR_PASSTHROUGH_BAND) {
+    // Natural variation zone — pass through directly
+    // This is what makes the app look like the Serial Monitor
+    smoothedHR = displayHR;
+  } else {
+    // Spike zone — ramp slowly, spike dies before it arrives
+    smoothedHR += (diff > 0) ? HR_SMOOTH_STEP : -HR_SMOOTH_STEP;
+  }
+}
+
+// ============================================================
+// HEART RATE HELPERS
+// ============================================================
+
+void seedBuffer(int refHR) {
+  for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = (float)refHR;
+  bpmBufIdx   = 0;
+  bpmBufCount = BPM_BUF_SIZE;
+}
+
+void enterReacq() {
+  reacqMode       = true;
+  reacqLastBeat   = 0;
+  reacqAgreeCount = 0;
+  stuckCounter    = 0;
+  if (displayHR > 0) {
+    lastKnownHR = displayHR;
+    seedBuffer(displayHR);
+  } else if (lastKnownHR > 0) {
+    seedBuffer(lastKnownHR);
+  }
+  displayHR = 0;
+}
+
+void resetHRState() {
+  bpmBufIdx       = 0;
+  bpmBufCount     = 0;
+  lastBeatMs      = 0;
+  displayHR       = 0;
+  smoothedHR      = 0;
+  warmupDone      = false;
+  reacqMode       = true;
+  reacqLastBeat   = 0;
+  reacqAgreeCount = 0;
+  stuckCounter    = 0;
+  for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = 0;
+}
+
+void resetSpO2State() {
+  bufferIndex          = 0;
+  spo2WarmupDone       = false;
+  spo2ConsecutiveValid = 0;
+}
+
+// ============================================================
+// BEAT ACCEPTANCE
+// ============================================================
+
+void acceptBeat(int candidate) {
+
+  if (reacqMode) {
+    bool hasReference = (lastKnownHR > 0);
+    int  lockCount    = hasReference ? HR_SEED_LOCK_COUNT : HR_COLD_LOCK_COUNT;
+
+    if (hasReference && abs(candidate - lastKnownHR) > HR_SEED_GATE) {
+      reacqLastBeat   = 0;
+      reacqAgreeCount = 0;
+      return;
+    }
+
+    if (reacqLastBeat == 0) {
+      reacqLastBeat   = candidate;
+      reacqAgreeCount = 1;
+      return;
+    }
+
+    if (abs(candidate - reacqLastBeat) <= HR_REACQ_AGREE) {
+      reacqAgreeCount++;
+      reacqLastBeat = candidate;
+
+      if (reacqAgreeCount >= lockCount) {
+        displayHR    = candidate;
+        lastKnownHR  = candidate;
+        stuckCounter = 0;
+        reacqMode    = false;
+      }
+    } else {
+      reacqLastBeat   = candidate;
+      reacqAgreeCount = 1;
+    }
+    return;
+  }
+
+  // Stable mode
+  if (abs(candidate - displayHR) <= HR_MAX_JUMP_STABLE) {
+    displayHR    = candidate;
+    lastKnownHR  = candidate;
+    stuckCounter = 0;
+  } else {
+    stuckCounter++;
+    if (stuckCounter >= HR_STUCK_LIMIT) {
+      lastKnownHR = candidate;
+      enterReacq();
+    }
+  }
+}
+
+void handleFingerDetected(long irValue) {
+  noFingerCounter = 0;
+
+  if (!fingerOn) {
+    fingerOn     = true;
+    fingerOnTime = millis();
+
+    if (lastKnownHR > 0 &&
+        fingerOffTime > 0 &&
+        (millis() - fingerOffTime) > HR_STALE_MS) {
+      lastKnownHR = 0;
+    }
+
+    resetHRState();
+    resetSpO2State();
+
+    if (lastKnownHR > 0) {
+      seedBuffer(lastKnownHR);
+      smoothedHR = lastKnownHR;
+    }
+
+    heartSensor.check();
+    while (heartSensor.available()) heartSensor.nextSample();
+    return;
+  }
+
+  if (!warmupDone) {
+    checkForBeat(irValue);
+    if (millis() - fingerOnTime < WARMUP_MS) return;
+    warmupDone = true;
+    lastBeatMs = millis();
+    return;
+  }
+
+  if (checkForBeat(irValue)) {
+    long now   = millis();
+    long delta = now - lastBeatMs;
+    lastBeatMs = now;
+
+    if (delta < 333 || delta > 1500) return;
+
+    float bpm = 60000.0f / (float)delta;
+    if (bpm < BPM_LOW || bpm > BPM_HIGH) return;
+
+    bpmBuffer[bpmBufIdx % BPM_BUF_SIZE] = bpm;
+    bpmBufIdx++;
+    if (bpmBufCount < BPM_BUF_SIZE) bpmBufCount++;
+
+    int candidate = (int)(getMedianBPM() + 0.5f);
+    acceptBeat(candidate);
+  }
+}
+
+void handleFingerRemoved() {
+  noFingerCounter++;
+  if (noFingerCounter > 50) {
+    if (displayHR > 0) {
+      lastKnownHR   = displayHR;
+      fingerOffTime = millis();
+    }
+    fingerOn    = false;
+    displayHR   = 0;
+    displaySpO2 = 0;
+    resetHRState();
+  }
+}
+
+// ============================================================
+// SPO2
+// ============================================================
+
+void shiftSpO2Buffer() {
+  for (byte i = SPO2_SHIFT; i < SPO2_BUFFER_LEN; i++) {
+    redBuffer[i - SPO2_SHIFT] = redBuffer[i];
+    irBuffer[i  - SPO2_SHIFT] = irBuffer[i];
+  }
+  bufferIndex = SPO2_BUFFER_LEN - SPO2_SHIFT;
+}
+
+void processSpO2Buffer() {
+  if (!fingerOn) {
+    bufferIndex = 0;
+    return;
+  }
+
+  if (!spo2WarmupDone) {
+    spo2WarmupDone = true;
+    bufferIndex    = 0;
+    return;
+  }
+
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, SPO2_BUFFER_LEN, redBuffer,
+    &spo2, &validSPO2, &maximHeartRate, &maximValidHR
+  );
+
+  if (validSPO2 == 1 && spo2 >= 85 && spo2 <= 100) {
+    spo2ConsecutiveValid++;
+    if (spo2ConsecutiveValid >= SPO2_CONFIRM_COUNT) {
+      displaySpO2 = spo2;
+    }
+  } else {
+    spo2ConsecutiveValid = 0;
+  }
+
+  shiftSpO2Buffer();
+}
+
+// ============================================================
+// IMU / MOTION
+// ============================================================
+
+void sampleIMU() {
+  float gyroX = myIMU.readFloatGyroX();
+  float gyroY = myIMU.readFloatGyroY();
+  float gyroZ = myIMU.readFloatGyroZ();
+  float gyroMag = sqrt(gyroX*gyroX + gyroY*gyroY + gyroZ*gyroZ);
+  accumulatedGyro += gyroMag;
+
+  float accX   = myIMU.readFloatAccelX();
+  float accY   = myIMU.readFloatAccelY();
+  float accZ   = myIMU.readFloatAccelZ();
+  float accMag = sqrt(accX*accX + accY*accY + accZ*accZ);
+  accMagSum   += accMag;
+  accMagSqSum += accMag * accMag;
+  motionSampleCount++;
+}
+
+void evaluateMotionStatus() {
+  if (motionSampleCount == 0) return;
+
+  float n           = (float)motionSampleCount;
+  float avgGyro     = accumulatedGyro / n;
+  float meanMag     = accMagSum / n;
+  float accVariance = (accMagSqSum / n) - (meanMag * meanMag);
+  if (accVariance < 0) accVariance = 0;
+
+  accumulatedGyro   = 0.0;
+  accMagSum         = 0.0;
+  accMagSqSum       = 0.0;
+  motionSampleCount = 0;
+
+  if (avgGyro < GYRO_STILL_THRESHOLD && accVariance < ACC_VARIANCE_THRESHOLD) {
+    motionStatus = "Still";
+  } else if (avgGyro > GYRO_ACTIVE_THRESHOLD) {
+    motionStatus = "Active Motion";
+  } else {
+    motionStatus = "Minor Motion";
+  }
+}
+
+// ============================================================
+// BLE / LED
+// ============================================================
+
+void broadcastMasterTime(unsigned long masterTime) {
+  if (Bluefruit.connected()) {
+    bleuart.println("SYNC,MT:" + String(masterTime));
+  }
+}
+
+void updateStatusLED() {
+  if (sensorError) {
+    digitalWrite(LED_RED, LOW); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH);
+    return;
+  }
+  digitalWrite(LED_RED,   HIGH);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_BLUE,  Bluefruit.connected() ? HIGH : LOW);
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(LED_RED,   OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_BLUE,  OUTPUT);
+  digitalWrite(LED_RED,   HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+  digitalWrite(LED_BLUE,  HIGH);
+
+  if (!bmp.begin(0x76)) {
+    Serial.println("BMP280 not found!");
+    sensorError = true;
+  }
+
+  if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    sensorError = true;
+  } else {
+    heartSensor.setup();
+    heartSensor.setPulseAmplitudeRed(0x1F);
+    heartSensor.setPulseAmplitudeIR(0x1F);
+  }
+
+  if (myIMU.begin() != 0) {
+    Serial.println("LSM6DS3 not found!");
+    sensorError = true;
+  }
+
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
+  Bluefruit.begin();
+  Bluefruit.setName("XIAO-Sensor 1");
+  bleuart.begin();
+
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart);
+  Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.start(0);
+
+  updateStatusLED();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+  heartSensor.check();
+
+  while (heartSensor.available()) {
+    redBuffer[bufferIndex] = heartSensor.getFIFORed();
+    irBuffer[bufferIndex]  = heartSensor.getFIFOIR();
+    long irValue           = irBuffer[bufferIndex];
+
+    bool wasFlushed = false;
+
+    if (irValue > 20000) {
+      bool wasOff = !fingerOn;
+      handleFingerDetected(irValue);
+      if (wasOff && fingerOn) wasFlushed = true;
+    } else {
+      handleFingerRemoved();
+    }
+
+    if (!wasFlushed) {
+      heartSensor.nextSample();
+      bufferIndex++;
+    }
+
+    if (bufferIndex >= SPO2_BUFFER_LEN) {
+      processSpO2Buffer();
+    }
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastImuReadTime >= imuReadInterval) {
+    lastImuReadTime = now;
+    sampleIMU();
+  }
+
+  if (now - lastSyncBroadcastTime >= syncBroadcastInterval) {
+    lastSyncBroadcastTime = now;
+    broadcastMasterTime(now);
+  }
+
+  if (now - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = now;
+    updateStatusLED();
+    evaluateMotionStatus();
+    updateSmoothedHR();
+
+    float tempF    = (bmp.readTemperature() * 1.8) + 32.0;
+    float pressure = bmp.readPressure() / 100.0F;
+    float altitude = bmp.readAltitude(seaLevelPressure_hPa);
+
+    String packet =
+      "T:"       + String(tempF, 1)    +
+      ",P:"      + String(pressure, 1) +
+      ",ALT:"    + String(altitude, 1) +
+      ",HR:"     + String(smoothedHR)  +
+      ",SPO2:"   + String(displaySpO2) +
+      ",MOTION:" + motionStatus;
+
+    Serial.println(packet);
+
+    if (Bluefruit.connected()) {
+      bleuart.println(packet);
+    }
+  }
+}
