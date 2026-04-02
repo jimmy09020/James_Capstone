@@ -22,21 +22,21 @@ unsigned long lastTransmissionTime  = 0;
 unsigned long lastSyncBroadcastTime = 0;
 unsigned long lastImuReadTime       = 0;
 
-const long transmissionInterval  = 500;
+const long transmissionInterval  = 250;   // was 500
 const long syncBroadcastInterval = 2000;
 const long imuReadInterval       = 20;
 
 // ============================================================
 // HEART RATE
 // ============================================================
-const int   BPM_BUF_SIZE = 5;
+const int   BPM_BUF_SIZE = 3;             // was 5
 const float BPM_LOW      = 40.0;
 const float BPM_HIGH     = 180.0;
 
 const int HR_MAX_JUMP_STABLE  = 15;
 const int HR_REACQ_AGREE      = 15;
-const int HR_COLD_LOCK_COUNT  = 3;
-const int HR_SEED_LOCK_COUNT  = 2;
+const int HR_COLD_LOCK_COUNT  = 2;        // was 3
+const int HR_SEED_LOCK_COUNT  = 1;        // was 2
 const int HR_SEED_GATE        = 20;
 const int HR_STUCK_LIMIT      = 6;
 
@@ -45,8 +45,8 @@ const unsigned long HR_STALE_MS = 30000UL;
 const int HR_PASSTHROUGH_BAND = 8;   // BPM — natural variation passes freely
 const int HR_SMOOTH_STEP      = 5;   // BPM/sec ramp for large jumps only
 
-const int HR_STEADY_BAND  = 5;       // only for initial lock-on
-const int HR_STEADY_COUNT = 3;       // consecutive agreeing readings before first display
+const int HR_STEADY_BAND  = 7;       // was 5
+const int HR_STEADY_COUNT = 2;       // was 3
 
 int smoothedHR = 0;
 
@@ -69,7 +69,7 @@ bool fingerOn        = false;
 int  noFingerCounter = 0;
 
 unsigned long fingerOnTime    = 0;
-const unsigned long WARMUP_MS = 500;
+const unsigned long WARMUP_MS = 250;   // was 500
 bool warmupDone = false;
 
 int  hrStableCandidate = 0;
@@ -182,7 +182,7 @@ void updateStableDisplayHR(int acceptedHR) {
 
   // ========================================================
   // INITIAL LOCK-ON ONLY:
-  // stay at 0 until readings are stable within ±5 BPM
+  // stay at 0 until readings are stable within the band
   // ========================================================
   if (!hrReadyToDisplay) {
     if (hrStableCount == 0 || abs(acceptedHR - hrStableCandidate) > HR_STEADY_BAND) {
@@ -207,7 +207,7 @@ void updateStableDisplayHR(int acceptedHR) {
 
   // ========================================================
   // NORMAL OPERATION:
-  // keep displaying continuously even if outside ±5 BPM
+  // keep displaying continuously even if outside steady band
   // ========================================================
   displayHR = acceptedHR;
   lastKnownHR = displayHR;
