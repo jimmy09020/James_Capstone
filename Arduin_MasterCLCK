@@ -1,5 +1,6 @@
 #include <bluefruit.h>
 #include <Wire.h>
+#include <math.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 #include "MAX30105.h"
@@ -7,75 +8,172 @@
 #include "spo2_algorithm.h"
 #include "LSM6DS3.h"
 
+// ============================================================
+// PERIPHERAL INSTANCES
+// ============================================================
 BLEUart bleuart;
 Adafruit_BMP280 bmp;
 MAX30105 heartSensor;
 LSM6DS3 myIMU(I2C_MODE, 0x6A);
 
-unsigned long lastTransmissionTime = 0;
-const long transmissionInterval = 1000;
-
-// ---------------- MASTER CLOCK VARIABLES ----------------
+// ============================================================
+// TIMING
+// ============================================================
+unsigned long lastTransmissionTime  = 0;
 unsigned long lastSyncBroadcastTime = 0;
+unsigned long lastImuReadTime       = 0;
+
+const long transmissionInterval  = 500;
 const long syncBroadcastInterval = 2000;
+const long imuReadInterval       = 20;
 
-// ---------------- HEART RATE VARIABLES ----------------
-const byte RATE_SIZE = 12;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-float beatsPerMinute;
-int beatAvg;
-int displayHR = 0;
-const int hrOffset = 4;
-bool fingerOn = false;
-int noFingerCounter = 0;
-int rejectedBeatsCounter = 0;
-int stabilizationCounter = 0; 
-unsigned long fingerTouchTime = 0; 
+// ============================================================
+// HEART RATE
+// ============================================================
+const int   BPM_BUF_SIZE = 5;
+const float BPM_LOW      = 40.0;
+const float BPM_HIGH     = 180.0;
 
-// --- SLOW UPDATE LOGIC ---
-unsigned long lastDisplayUpdateTime = 0;
-const long displayUpdateInterval = 3000; // Update the BPM every 3 seconds
-int pendingHR = 0; 
+const int HR_MAX_JUMP_STABLE  = 15;
+const int HR_REACQ_AGREE      = 15;
+const int HR_COLD_LOCK_COUNT  = 3;
+const int HR_SEED_LOCK_COUNT  = 2;
+const int HR_SEED_GATE        = 20;
+const int HR_STUCK_LIMIT      = 6;
 
-// ---------------- SPO2 VARIABLES ----------------
-uint32_t irBuffer[100];
-uint32_t redBuffer[100];
-int32_t bufferLength = 100;
-int32_t spo2 = 0;
-int8_t validSPO2 = 0;
-int32_t maximHeartRate;
-int8_t maximValidHR;
-byte bufferIndex = 0;
-int displaySpO2 = 0;
+const unsigned long HR_STALE_MS = 30000UL;
 
-// ---------------- ESTIMATED BLOOD PRESSURE VARIABLES ----------------
-float estimatedSBP = 0;
-float estimatedDBP = 0;
-float estimatedMAP = 0;
+const int HR_PASSTHROUGH_BAND = 8;
+const int HR_SMOOTH_STEP      = 5;
+
+const int HR_STEADY_BAND  = 5;
+const int HR_STEADY_COUNT = 3;
+
+int smoothedHR = 0;
+
+float bpmBuffer[BPM_BUF_SIZE];
+int   bpmBufIdx   = 0;
+int   bpmBufCount = 0;
+
+long  lastBeatMs  = 0;
+int   displayHR   = 0;
+int   lastKnownHR = 0;
+
+unsigned long fingerOffTime = 0;
+
+bool reacqMode       = true;
+int  reacqLastBeat   = 0;
+int  reacqAgreeCount = 0;
+int  stuckCounter    = 0;
+
+bool fingerOn        = false;
+int  noFingerCounter = 0;
+
+unsigned long fingerOnTime    = 0;
+const unsigned long WARMUP_MS = 500;
+bool warmupDone = false;
+
+int  hrStableCandidate = 0;
+int  hrStableCount     = 0;
+bool hrReadyToDisplay  = false;
+
+// ============================================================
+// SPO2
+// ============================================================
+const int32_t SPO2_BUFFER_LEN = 100;
+const byte    SPO2_SHIFT      = 25;
+
+uint32_t irBuffer[SPO2_BUFFER_LEN];
+uint32_t redBuffer[SPO2_BUFFER_LEN];
+int32_t  spo2           = 0;
+int8_t   validSPO2      = 0;
+int32_t  maximHeartRate = 0;
+int8_t   maximValidHR   = 0;
+byte     bufferIndex    = 0;
+int      displaySpO2    = 0;
+
+bool spo2WarmupDone       = false;
+int  spo2ConsecutiveValid = 0;
+const int SPO2_CONFIRM_COUNT = 2;
+
+// ============================================================
+// ESTIMATED BLOOD PRESSURE
+// ============================================================
+float estimatedSBP = 0.0;
+float estimatedDBP = 0.0;
+float estimatedMAP = 0.0;
 float baselineSBP = 120.0;
 float baselineDBP = 80.0;
 
-// ---------------- ALTITUDE VARIABLES ----------------
+// ============================================================
+// ENVIRONMENT (BMP280)
+// ============================================================
 float seaLevelPressure_hPa = 1013.25;
 
-// ---------------- ACCELEROMETER VARIABLES ----------------
-float prevAccX = 0, prevAccY = 0, prevAccZ = 0;
-float accumulatedMotion = 0.0;
-int motionSampleCount = 0;
-unsigned long lastImuReadTime = 0;
-const long imuReadInterval = 20; 
-String motionStatus = "Unknown";
+// ============================================================
+// ACCELEROMETER / MOTION
+// ============================================================
+float  accumulatedGyro   = 0.0;
+float  accMagSum         = 0.0;
+float  accMagSqSum       = 0.0;
+int    motionSampleCount = 0;
+String motionStatus      = "Unknown";
 
-// ---------------- SYSTEM VARIABLES ----------------
+const float GYRO_STILL_THRESHOLD   = 15.0;
+const float GYRO_ACTIVE_THRESHOLD  = 80.0;
+const float ACC_VARIANCE_THRESHOLD = 0.01;
+
+// ============================================================
+// SYSTEM
+// ============================================================
 bool sensorError = false;
 
+// ============================================================
+// WEIGHTED HR FILTER
+// ============================================================
+float getWeightedMeanBPM() {
+  int n = (bpmBufCount < BPM_BUF_SIZE) ? bpmBufCount : BPM_BUF_SIZE;
+  if (n == 0) return 0.0f;
+
+  int startIdx = (bpmBufCount < BPM_BUF_SIZE) ? 0 : (bpmBufIdx % BPM_BUF_SIZE);
+
+  float weightedSum = 0.0f;
+  float totalWeight = 0.0f;
+
+  for (int i = 0; i < n; i++) {
+    int idx = (startIdx + i) % BPM_BUF_SIZE;
+    float weight = (float)(i + 1);
+    weightedSum += bpmBuffer[idx] * weight;
+    totalWeight += weight;
+  }
+
+  return weightedSum / totalWeight;
+}
+
+void updateSmoothedHR() {
+  if (displayHR == 0) {
+    smoothedHR = 0;
+    return;
+  }
+
+  if (smoothedHR == 0) {
+    smoothedHR = displayHR;
+    return;
+  }
+
+  int diff    = displayHR - smoothedHR;
+  int absDiff = abs(diff);
+
+  if (absDiff <= HR_PASSTHROUGH_BAND) {
+    smoothedHR = displayHR;
+  } else {
+    smoothedHR += (diff > 0) ? HR_SMOOTH_STEP : -HR_SMOOTH_STEP;
+  }
+}
 
 // ============================================================
-// HELPER FUNCTIONS
+// BLOOD PRESSURE HELPERS
 // ============================================================
-
 float calculatePulseAmplitude(uint32_t signalBuffer[], int length) {
   uint32_t maxValue = 0;
   uint32_t minValue = 0xFFFFFFFF;
@@ -88,73 +186,331 @@ float calculatePulseAmplitude(uint32_t signalBuffer[], int length) {
   return (float)(maxValue - minValue);
 }
 
+void resetBloodPressureState() {
+  estimatedSBP = 0.0;
+  estimatedDBP = 0.0;
+  estimatedMAP = 0.0;
+}
+
 void updateEstimatedBloodPressure() {
-  if (!fingerOn || (millis() - fingerTouchTime < 1500) || stabilizationCounter < 4) {
-    estimatedSBP = 0;
-    estimatedDBP = 0;
+  if (!fingerOn || (millis() - fingerOnTime < 1500) || !hrReadyToDisplay) {
+    estimatedSBP = 0.0;
+    estimatedDBP = 0.0;
+    estimatedMAP = 0.0;
     return;
   }
 
-  float pulseAmplitude = calculatePulseAmplitude(irBuffer, bufferLength);
+  float pulseAmplitude = calculatePulseAmplitude(irBuffer, SPO2_BUFFER_LEN);
 
   if (pulseAmplitude > 50000) return;
 
-  estimatedSBP = baselineSBP + (pulseAmplitude * 0.0008);
-  estimatedDBP = baselineDBP + (pulseAmplitude * 0.0004);
+  estimatedSBP = baselineSBP + (pulseAmplitude * 0.0008f);
+  estimatedDBP = baselineDBP + (pulseAmplitude * 0.0004f);
 
   if (estimatedSBP < 80) estimatedSBP = 80;
   if (estimatedSBP > 180) estimatedSBP = 180;
   if (estimatedDBP < 50) estimatedDBP = 50;
   if (estimatedDBP > 120) estimatedDBP = 120;
 
-  estimatedMAP = estimatedDBP + ((estimatedSBP - estimatedDBP) / 3.0);
+  estimatedMAP = estimatedDBP + ((estimatedSBP - estimatedDBP) / 3.0f);
 }
 
-void sampleIMU() {
-  float accX = myIMU.readFloatAccelX();
-  float accY = myIMU.readFloatAccelY();
-  float accZ = myIMU.readFloatAccelZ();
+// ============================================================
+// HEART RATE HELPERS
+// ============================================================
+void seedBuffer(int refHR) {
+  for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = (float)refHR;
+  bpmBufIdx   = 0;
+  bpmBufCount = BPM_BUF_SIZE;
+}
 
-  if (prevAccX == 0.0 && prevAccY == 0.0 && prevAccZ == 0.0) {
-    prevAccX = accX; prevAccY = accY; prevAccZ = accZ;
+void updateStableDisplayHR(int acceptedHR) {
+  if (acceptedHR <= 0) return;
+
+  if (!hrReadyToDisplay) {
+    if (hrStableCount == 0 || abs(acceptedHR - hrStableCandidate) > HR_STEADY_BAND) {
+      hrStableCandidate = acceptedHR;
+      hrStableCount = 1;
+      displayHR = 0;
+      return;
+    }
+
+    hrStableCandidate = (hrStableCandidate + acceptedHR + 1) / 2;
+    hrStableCount++;
+
+    if (hrStableCount >= HR_STEADY_COUNT) {
+      displayHR = hrStableCandidate;
+      lastKnownHR = displayHR;
+      hrReadyToDisplay = true;
+    } else {
+      displayHR = 0;
+    }
     return;
   }
 
-  float deltaX = accX - prevAccX;
-  float deltaY = accY - prevAccY;
-  float deltaZ = accZ - prevAccZ;
+  displayHR = acceptedHR;
+  lastKnownHR = displayHR;
 
-  float instMotion = sqrt((deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ));
+  if (abs(acceptedHR - hrStableCandidate) <= HR_STEADY_BAND) {
+    hrStableCandidate = acceptedHR;
+    hrStableCount = HR_STEADY_COUNT;
+  } else {
+    hrStableCandidate = acceptedHR;
+    hrStableCount = 1;
+  }
+}
 
-  accumulatedMotion += instMotion;
+void enterReacq() {
+  reacqMode         = true;
+  reacqLastBeat     = 0;
+  reacqAgreeCount   = 0;
+  stuckCounter      = 0;
+  hrStableCandidate = 0;
+  hrStableCount     = 0;
+  hrReadyToDisplay  = false;
+
+  if (displayHR > 0) {
+    lastKnownHR = displayHR;
+    seedBuffer(displayHR);
+  } else if (lastKnownHR > 0) {
+    seedBuffer(lastKnownHR);
+  }
+
+  displayHR = 0;
+}
+
+void resetHRState() {
+  bpmBufIdx         = 0;
+  bpmBufCount       = 0;
+  lastBeatMs        = 0;
+  displayHR         = 0;
+  smoothedHR        = 0;
+  warmupDone        = false;
+  reacqMode         = true;
+  reacqLastBeat     = 0;
+  reacqAgreeCount   = 0;
+  stuckCounter      = 0;
+
+  hrStableCandidate = 0;
+  hrStableCount     = 0;
+  hrReadyToDisplay  = false;
+
+  for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = 0;
+}
+
+void resetSpO2State() {
+  bufferIndex          = 0;
+  spo2WarmupDone       = false;
+  spo2ConsecutiveValid = 0;
+  displaySpO2          = 0;
+}
+
+// ============================================================
+// BEAT ACCEPTANCE
+// ============================================================
+void acceptBeat(int candidate) {
+  if (reacqMode) {
+    bool hasReference = (lastKnownHR > 0);
+    int  lockCount    = hasReference ? HR_SEED_LOCK_COUNT : HR_COLD_LOCK_COUNT;
+
+    if (hasReference && abs(candidate - lastKnownHR) > HR_SEED_GATE) {
+      reacqLastBeat   = 0;
+      reacqAgreeCount = 0;
+      return;
+    }
+
+    if (reacqLastBeat == 0) {
+      reacqLastBeat   = candidate;
+      reacqAgreeCount = 1;
+      return;
+    }
+
+    if (abs(candidate - reacqLastBeat) <= HR_REACQ_AGREE) {
+      reacqAgreeCount++;
+      reacqLastBeat = candidate;
+
+      if (reacqAgreeCount >= lockCount) {
+        stuckCounter = 0;
+        reacqMode    = false;
+        updateStableDisplayHR(candidate);
+      }
+    } else {
+      reacqLastBeat   = candidate;
+      reacqAgreeCount = 1;
+    }
+    return;
+  }
+
+  if (displayHR == 0 || abs(candidate - lastKnownHR) <= HR_MAX_JUMP_STABLE) {
+    stuckCounter = 0;
+    updateStableDisplayHR(candidate);
+  } else {
+    stuckCounter++;
+    if (stuckCounter >= HR_STUCK_LIMIT) {
+      lastKnownHR = candidate;
+      enterReacq();
+    }
+  }
+}
+
+void handleFingerDetected(long irValue) {
+  noFingerCounter = 0;
+
+  if (!fingerOn) {
+    fingerOn     = true;
+    fingerOnTime = millis();
+
+    if (lastKnownHR > 0 &&
+        fingerOffTime > 0 &&
+        (millis() - fingerOffTime) > HR_STALE_MS) {
+      lastKnownHR = 0;
+    }
+
+    resetHRState();
+    resetSpO2State();
+    resetBloodPressureState();
+
+    if (lastKnownHR > 0) {
+      seedBuffer(lastKnownHR);
+    }
+
+    heartSensor.check();
+    while (heartSensor.available()) heartSensor.nextSample();
+    return;
+  }
+
+  if (!warmupDone) {
+    checkForBeat(irValue);
+    if (millis() - fingerOnTime < WARMUP_MS) return;
+    warmupDone = true;
+    lastBeatMs = millis();
+    return;
+  }
+
+  if (checkForBeat(irValue)) {
+    long now   = millis();
+    long delta = now - lastBeatMs;
+    lastBeatMs = now;
+
+    if (delta < 333 || delta > 1500) return;
+
+    float bpm = 60000.0f / (float)delta;
+    if (bpm < BPM_LOW || bpm > BPM_HIGH) return;
+
+    bpmBuffer[bpmBufIdx % BPM_BUF_SIZE] = bpm;
+    bpmBufIdx++;
+    if (bpmBufCount < BPM_BUF_SIZE) bpmBufCount++;
+
+    int candidate = (int)(getWeightedMeanBPM() + 0.5f);
+    acceptBeat(candidate);
+  }
+}
+
+void handleFingerRemoved() {
+  noFingerCounter++;
+  if (noFingerCounter > 50) {
+    if (displayHR > 0) {
+      lastKnownHR   = displayHR;
+      fingerOffTime = millis();
+    }
+    fingerOn    = false;
+    displayHR   = 0;
+    displaySpO2 = 0;
+    resetBloodPressureState();
+    resetHRState();
+  }
+}
+
+// ============================================================
+// SPO2
+// ============================================================
+void shiftSpO2Buffer() {
+  for (byte i = SPO2_SHIFT; i < SPO2_BUFFER_LEN; i++) {
+    redBuffer[i - SPO2_SHIFT] = redBuffer[i];
+    irBuffer[i  - SPO2_SHIFT] = irBuffer[i];
+  }
+  bufferIndex = SPO2_BUFFER_LEN - SPO2_SHIFT;
+}
+
+void processSpO2Buffer() {
+  if (!fingerOn) {
+    bufferIndex = 0;
+    resetBloodPressureState();
+    return;
+  }
+
+  if (!spo2WarmupDone) {
+    spo2WarmupDone = true;
+    bufferIndex    = 0;
+    return;
+  }
+
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, SPO2_BUFFER_LEN, redBuffer,
+    &spo2, &validSPO2, &maximHeartRate, &maximValidHR
+  );
+
+  if (validSPO2 == 1 && spo2 >= 85 && spo2 <= 100) {
+    spo2ConsecutiveValid++;
+    if (spo2ConsecutiveValid >= SPO2_CONFIRM_COUNT) {
+      displaySpO2 = spo2;
+    }
+  } else {
+    spo2ConsecutiveValid = 0;
+  }
+
+  updateEstimatedBloodPressure();
+  shiftSpO2Buffer();
+}
+
+// ============================================================
+// IMU / MOTION
+// ============================================================
+void sampleIMU() {
+  float gyroX = myIMU.readFloatGyroX();
+  float gyroY = myIMU.readFloatGyroY();
+  float gyroZ = myIMU.readFloatGyroZ();
+  float gyroMag = sqrt(gyroX*gyroX + gyroY*gyroY + gyroZ*gyroZ);
+  accumulatedGyro += gyroMag;
+
+  float accX   = myIMU.readFloatAccelX();
+  float accY   = myIMU.readFloatAccelY();
+  float accZ   = myIMU.readFloatAccelZ();
+  float accMag = sqrt(accX*accX + accY*accY + accZ*accZ);
+  accMagSum   += accMag;
+  accMagSqSum += accMag * accMag;
   motionSampleCount++;
-
-  prevAccX = accX;
-  prevAccY = accY;
-  prevAccZ = accZ;
 }
 
 void evaluateMotionStatus() {
   if (motionSampleCount == 0) return;
 
-  float avgMotion = accumulatedMotion / motionSampleCount;
+  float n           = (float)motionSampleCount;
+  float avgGyro     = accumulatedGyro / n;
+  float meanMag     = accMagSum / n;
+  float accVariance = (accMagSqSum / n) - (meanMag * meanMag);
+  if (accVariance < 0) accVariance = 0;
 
-  accumulatedMotion = 0.0;
+  accumulatedGyro   = 0.0;
+  accMagSum         = 0.0;
+  accMagSqSum       = 0.0;
   motionSampleCount = 0;
 
-  if (avgMotion < 0.015) {
+  if (avgGyro < GYRO_STILL_THRESHOLD && accVariance < ACC_VARIANCE_THRESHOLD) {
     motionStatus = "Still";
-  } else if (avgMotion < 0.25) {
-    motionStatus = "Minor Motion";
-  } else {
+  } else if (avgGyro > GYRO_ACTIVE_THRESHOLD) {
     motionStatus = "Active Motion";
+  } else {
+    motionStatus = "Minor Motion";
   }
 }
 
+// ============================================================
+// BLE / LED
+// ============================================================
 void broadcastMasterTime(unsigned long masterTime) {
-  String syncPacket = "SYNC,MT:" + String(masterTime);
   if (Bluefruit.connected()) {
-    bleuart.println(syncPacket);
+    bleuart.println("SYNC,MT:" + String(masterTime));
   }
 }
 
@@ -165,50 +521,41 @@ void updateStatusLED() {
     digitalWrite(LED_BLUE, HIGH);
     return;
   }
-
-  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_RED,   HIGH);
   digitalWrite(LED_GREEN, LOW);
-
-  if (Bluefruit.connected()) {
-    digitalWrite(LED_BLUE, HIGH);
-  } else {
-    digitalWrite(LED_BLUE, LOW);
-  }
+  digitalWrite(LED_BLUE,  Bluefruit.connected() ? HIGH : LOW);
 }
 
 // ============================================================
 // SETUP
 // ============================================================
-
 void setup() {
   Serial.begin(115200);
   delay(2000);
-  Serial.println("System Initializing...");
 
-  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_RED,   OUTPUT);
   pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_BLUE, OUTPUT);
-
-  digitalWrite(LED_RED, HIGH);
+  pinMode(LED_BLUE,  OUTPUT);
+  digitalWrite(LED_RED,   HIGH);
   digitalWrite(LED_GREEN, HIGH);
-  digitalWrite(LED_BLUE, HIGH);
+  digitalWrite(LED_BLUE,  HIGH);
 
   if (!bmp.begin(0x76)) {
-    Serial.println("BMP280 Error");
+    Serial.println("BMP280 not found!");
     sensorError = true;
   }
 
   if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("MAX30105 Error");
+    Serial.println("MAX30102 not found!");
     sensorError = true;
   } else {
-    heartSensor.setup(); 
-    heartSensor.setPulseAmplitudeRed(0x1F); 
-    heartSensor.setPulseAmplitudeIR(0x1F);  
+    heartSensor.setup();
+    heartSensor.setPulseAmplitudeRed(0x1F);
+    heartSensor.setPulseAmplitudeIR(0x1F);
   }
 
   if (myIMU.begin() != 0) {
-    Serial.println("IMU Error");
+    Serial.println("LSM6DS3 not found!");
     sensorError = true;
   }
 
@@ -224,182 +571,76 @@ void setup() {
   Bluefruit.Advertising.start(0);
 
   updateStatusLED();
-  Serial.println("Setup Complete");
 }
 
 // ============================================================
 // MAIN LOOP
 // ============================================================
-
 void loop() {
   heartSensor.check();
 
   while (heartSensor.available()) {
     redBuffer[bufferIndex] = heartSensor.getFIFORed();
-    irBuffer[bufferIndex] = heartSensor.getFIFOIR();
+    irBuffer[bufferIndex]  = heartSensor.getFIFOIR();
+    long irValue           = irBuffer[bufferIndex];
 
-    long irValue = irBuffer[bufferIndex];
+    bool wasFlushed = false;
 
-    if (irValue > 30000) { 
-      noFingerCounter = 0;
-
-      if (fingerOn == false) {
-        fingerOn = true;
-        fingerTouchTime = millis(); 
-        lastDisplayUpdateTime = millis(); // Reset update timer
-        for (byte i = 0 ; i < RATE_SIZE ; i++) rates[i] = 0;
-        rateSpot = 0;
-        lastBeat = millis();
-        displaySpO2 = 0;
-        displayHR = 0;
-        pendingHR = 0;
-        estimatedSBP = 0;
-        estimatedDBP = 0;
-        bufferIndex = 0;
-        beatAvg = 0;
-        rejectedBeatsCounter = 0;
-        stabilizationCounter = 0;
-      }
-
-      if (millis() - fingerTouchTime < 1500) {
-        heartSensor.nextSample();
-        bufferIndex++;
-        if (bufferIndex == 100) bufferIndex = 0;
-        continue;
-      }
-
-      if (checkForBeat(irValue) == true) {
-        long delta = millis() - lastBeat;
-        lastBeat = millis();
-
-        beatsPerMinute = 60 / (delta / 1000.0);
-
-        if (stabilizationCounter < 4) {
-          stabilizationCounter++;
-          continue; 
-        }
-
-        // Noise gate
-        if (millis() - fingerTouchTime < 8000 && beatsPerMinute > 108) continue;
-
-        if (beatsPerMinute <= 150 && beatsPerMinute >= 45) {
-          if (beatAvg == 0 || abs((int)beatsPerMinute - beatAvg) <= 25) {
-            rejectedBeatsCounter = 0;
-
-            rates[rateSpot++] = (byte)beatsPerMinute;
-            rateSpot %= RATE_SIZE;
-
-            beatAvg = 0;
-            byte validBeats = 0;
-            for (byte x = 0 ; x < RATE_SIZE ; x++) {
-              if (rates[x] > 0) {
-                beatAvg += rates[x];
-                validBeats++;
-              }
-            }
-            if (validBeats > 0) {
-              beatAvg /= validBeats;
-              
-              // Instead of updating displayHR directly, we store the calculation
-              pendingHR = beatAvg;
-            }
-          } else {
-            rejectedBeatsCounter++;
-            if (rejectedBeatsCounter >= 4) {
-              beatAvg = 0; 
-              rejectedBeatsCounter = 0;
-            }
-          }
-        }
-      }
-    }
-    else {
-      noFingerCounter++;
-      displayHR = 0;
-      pendingHR = 0;
-      displaySpO2 = 0;
-      estimatedSBP = 0;
-      estimatedDBP = 0;
-      stabilizationCounter = 0;
-
-      if (noFingerCounter > 15) { 
-        fingerOn = false;
-        beatAvg = 0;
-      }
+    if (irValue > 20000) {
+      bool wasOff = !fingerOn;
+      handleFingerDetected(irValue);
+      if (wasOff && fingerOn) wasFlushed = true;
+    } else {
+      handleFingerRemoved();
     }
 
-    heartSensor.nextSample();
-    bufferIndex++;
+    if (!wasFlushed) {
+      heartSensor.nextSample();
+      bufferIndex++;
+    }
 
-    if (bufferIndex == 100) {
-      if (fingerOn && (millis() - fingerTouchTime > 1500) && stabilizationCounter >= 4) {
-        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &maximHeartRate, &maximValidHR);
-        if (validSPO2 == 1 && spo2 > 88 && spo2 <= 100) displaySpO2 = spo2;
-        updateEstimatedBloodPressure();
-      }
-
-      for (byte i = 25; i < 100; i++) {
-        redBuffer[i - 25] = redBuffer[i];
-        irBuffer[i - 25] = irBuffer[i];
-      }
-      bufferIndex = 75;
+    if (bufferIndex >= SPO2_BUFFER_LEN) {
+      processSpO2Buffer();
     }
   }
 
-  unsigned long currentMillis = millis();
+  unsigned long now = millis();
 
-  // --- STEPPED DISPLAY UPDATE ---
-  // Only update the actual HR shown every 3 seconds to prevent "frozen" or "jittery" feel
-  if (fingerOn && stabilizationCounter >= 4) {
-    if (currentMillis - lastDisplayUpdateTime >= displayUpdateInterval) {
-      lastDisplayUpdateTime = currentMillis;
-      
-      if (pendingHR > 0) {
-        // Apply a small smoothing step toward the pending HR
-        if (displayHR == 0) displayHR = pendingHR;
-        else {
-            // Move by roughly 1/2 the distance to the target for a smooth feel
-            displayHR = (pendingHR * 0.5) + (displayHR * 0.5);
-        }
-      }
-    }
-  }
-
-  if (currentMillis - lastImuReadTime >= imuReadInterval) {
-    lastImuReadTime = currentMillis;
+  if (now - lastImuReadTime >= imuReadInterval) {
+    lastImuReadTime = now;
     sampleIMU();
   }
 
-  if (currentMillis - lastSyncBroadcastTime >= syncBroadcastInterval) {
-    lastSyncBroadcastTime = currentMillis;
-    broadcastMasterTime(currentMillis);
+  if (now - lastSyncBroadcastTime >= syncBroadcastInterval) {
+    lastSyncBroadcastTime = now;
+    broadcastMasterTime(now);
   }
 
-  if (currentMillis - lastTransmissionTime >= transmissionInterval) {
-    lastTransmissionTime = currentMillis;
+  if (now - lastTransmissionTime >= transmissionInterval) {
+    lastTransmissionTime = now;
     updateStatusLED();
-
-    float realTempF = (bmp.readTemperature() * 1.8) + 32.0;
-    float realPressure = bmp.readPressure() / 100.0F;
-    float realAlt = bmp.readAltitude(seaLevelPressure_hPa);
     evaluateMotionStatus();
+    updateSmoothedHR();
 
-    int finalHR = 0;
-    if (displayHR > 0 && stabilizationCounter >= 4) {
-      finalHR = displayHR + hrOffset;
-    }
+    float tempF    = (bmp.readTemperature() * 1.8) + 32.0;
+    float pressure = bmp.readPressure() / 100.0F;
+    float altitude = bmp.readAltitude(seaLevelPressure_hPa);
 
     String packet =
-      "T:" + String(realTempF, 1) +
-      ",P:" + String(realPressure, 1) +
-      ",ALT:" + String(realAlt, 1) +
-      ",HR:" + String(finalHR) +
-      ",SPO2:" + String(displaySpO2) +
-      ",SBP:" + String(estimatedSBP, 1) +
-      ",DBP:" + String(estimatedDBP, 1) +
+      "T:"       + String(tempF, 1)          +
+      ",P:"      + String(pressure, 1)       +
+      ",ALT:"    + String(altitude, 1)       +
+      ",HR:"     + String(smoothedHR)        +
+      ",SPO2:"   + String(displaySpO2)       +
+      ",SBP:"    + String(estimatedSBP, 1)   +
+      ",DBP:"    + String(estimatedDBP, 1)   +
+      ",MAP:"    + String(estimatedMAP, 1)   +
       ",MOTION:" + motionStatus;
 
     Serial.println(packet);
-    if (Bluefruit.connected()) bleuart.println(packet);
+
+    if (Bluefruit.connected()) {
+      bleuart.println(packet);
+    }
   }
 }
