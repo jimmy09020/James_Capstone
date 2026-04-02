@@ -45,6 +45,9 @@ const unsigned long HR_STALE_MS = 30000UL;
 const int HR_PASSTHROUGH_BAND = 8;   // BPM — natural variation passes freely
 const int HR_SMOOTH_STEP      = 5;   // BPM/sec ramp for large jumps only
 
+const int HR_STEADY_BAND  = 5;       // only for initial lock-on
+const int HR_STEADY_COUNT = 3;       // consecutive agreeing readings before first display
+
 int smoothedHR = 0;
 
 float bpmBuffer[BPM_BUF_SIZE];
@@ -68,6 +71,10 @@ int  noFingerCounter = 0;
 unsigned long fingerOnTime    = 0;
 const unsigned long WARMUP_MS = 500;
 bool warmupDone = false;
+
+int  hrStableCandidate = 0;
+int  hrStableCount     = 0;
+bool hrReadyToDisplay  = false;
 
 // ============================================================
 // SPO2
@@ -111,52 +118,52 @@ const float ACC_VARIANCE_THRESHOLD = 0.01;
 // ============================================================
 bool sensorError = false;
 
-
 // ============================================================
-// MEDIAN FILTER
+// WEIGHTED HR FILTER
 // ============================================================
-
-float getMedianBPM() {
+float getWeightedMeanBPM() {
   int n = (bpmBufCount < BPM_BUF_SIZE) ? bpmBufCount : BPM_BUF_SIZE;
-  float sorted[BPM_BUF_SIZE];
-  for (int i = 0; i < n; i++) sorted[i] = bpmBuffer[i];
+  if (n == 0) return 0.0f;
 
-  for (int i = 0; i < n - 1; i++) {
-    for (int j = 0; j < n - i - 1; j++) {
-      if (sorted[j] > sorted[j + 1]) {
-        float tmp     = sorted[j];
-        sorted[j]     = sorted[j + 1];
-        sorted[j + 1] = tmp;
-      }
-    }
+  int startIdx = (bpmBufCount < BPM_BUF_SIZE) ? 0 : (bpmBufIdx % BPM_BUF_SIZE);
+
+  float weightedSum = 0.0f;
+  float totalWeight = 0.0f;
+
+  for (int i = 0; i < n; i++) {
+    int idx = (startIdx + i) % BPM_BUF_SIZE;
+
+    // oldest = 1, newest = n
+    float weight = (float)(i + 1);
+
+    weightedSum += bpmBuffer[idx] * weight;
+    totalWeight += weight;
   }
-  return sorted[n / 2];
+
+  return weightedSum / totalWeight;
 }
 
-
 void updateSmoothedHR() {
-  // Finger off — snap to 0 immediately
+  // Finger off or not yet ready to display
   if (displayHR == 0) {
     smoothedHR = 0;
     return;
   }
 
-  // First reading after lock-on — seed immediately so app
-  // doesn't sit at 0 for several cycles
+  // First visible reading after lock-on
   if (smoothedHR == 0) {
     smoothedHR = displayHR;
     return;
   }
 
-  int diff = displayHR - smoothedHR;
+  int diff    = displayHR - smoothedHR;
   int absDiff = abs(diff);
 
   if (absDiff <= HR_PASSTHROUGH_BAND) {
-    // Natural variation zone — pass through directly
-    // This is what makes the app look like the Serial Monitor
+    // Natural variation: pass directly
     smoothedHR = displayHR;
   } else {
-    // Spike zone — ramp slowly, spike dies before it arrives
+    // Large jump: ramp toward it
     smoothedHR += (diff > 0) ? HR_SMOOTH_STEP : -HR_SMOOTH_STEP;
   }
 }
@@ -164,38 +171,92 @@ void updateSmoothedHR() {
 // ============================================================
 // HEART RATE HELPERS
 // ============================================================
-
 void seedBuffer(int refHR) {
   for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = (float)refHR;
   bpmBufIdx   = 0;
   bpmBufCount = BPM_BUF_SIZE;
 }
 
+void updateStableDisplayHR(int acceptedHR) {
+  if (acceptedHR <= 0) return;
+
+  // ========================================================
+  // INITIAL LOCK-ON ONLY:
+  // stay at 0 until readings are stable within ±5 BPM
+  // ========================================================
+  if (!hrReadyToDisplay) {
+    if (hrStableCount == 0 || abs(acceptedHR - hrStableCandidate) > HR_STEADY_BAND) {
+      hrStableCandidate = acceptedHR;
+      hrStableCount = 1;
+      displayHR = 0;
+      return;
+    }
+
+    hrStableCandidate = (hrStableCandidate + acceptedHR + 1) / 2;
+    hrStableCount++;
+
+    if (hrStableCount >= HR_STEADY_COUNT) {
+      displayHR = hrStableCandidate;
+      lastKnownHR = displayHR;
+      hrReadyToDisplay = true;
+    } else {
+      displayHR = 0;
+    }
+    return;
+  }
+
+  // ========================================================
+  // NORMAL OPERATION:
+  // keep displaying continuously even if outside ±5 BPM
+  // ========================================================
+  displayHR = acceptedHR;
+  lastKnownHR = displayHR;
+
+  // Background tracking only
+  if (abs(acceptedHR - hrStableCandidate) <= HR_STEADY_BAND) {
+    hrStableCandidate = acceptedHR;
+    hrStableCount = HR_STEADY_COUNT;
+  } else {
+    hrStableCandidate = acceptedHR;
+    hrStableCount = 1;
+  }
+}
+
 void enterReacq() {
-  reacqMode       = true;
-  reacqLastBeat   = 0;
-  reacqAgreeCount = 0;
-  stuckCounter    = 0;
+  reacqMode         = true;
+  reacqLastBeat     = 0;
+  reacqAgreeCount   = 0;
+  stuckCounter      = 0;
+  hrStableCandidate = 0;
+  hrStableCount     = 0;
+  hrReadyToDisplay  = false;
+
   if (displayHR > 0) {
     lastKnownHR = displayHR;
     seedBuffer(displayHR);
   } else if (lastKnownHR > 0) {
     seedBuffer(lastKnownHR);
   }
+
   displayHR = 0;
 }
 
 void resetHRState() {
-  bpmBufIdx       = 0;
-  bpmBufCount     = 0;
-  lastBeatMs      = 0;
-  displayHR       = 0;
-  smoothedHR      = 0;
-  warmupDone      = false;
-  reacqMode       = true;
-  reacqLastBeat   = 0;
-  reacqAgreeCount = 0;
-  stuckCounter    = 0;
+  bpmBufIdx         = 0;
+  bpmBufCount       = 0;
+  lastBeatMs        = 0;
+  displayHR         = 0;
+  smoothedHR        = 0;
+  warmupDone        = false;
+  reacqMode         = true;
+  reacqLastBeat     = 0;
+  reacqAgreeCount   = 0;
+  stuckCounter      = 0;
+
+  hrStableCandidate = 0;
+  hrStableCount     = 0;
+  hrReadyToDisplay  = false;
+
   for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = 0;
 }
 
@@ -208,9 +269,7 @@ void resetSpO2State() {
 // ============================================================
 // BEAT ACCEPTANCE
 // ============================================================
-
 void acceptBeat(int candidate) {
-
   if (reacqMode) {
     bool hasReference = (lastKnownHR > 0);
     int  lockCount    = hasReference ? HR_SEED_LOCK_COUNT : HR_COLD_LOCK_COUNT;
@@ -232,10 +291,9 @@ void acceptBeat(int candidate) {
       reacqLastBeat = candidate;
 
       if (reacqAgreeCount >= lockCount) {
-        displayHR    = candidate;
-        lastKnownHR  = candidate;
         stuckCounter = 0;
         reacqMode    = false;
+        updateStableDisplayHR(candidate);
       }
     } else {
       reacqLastBeat   = candidate;
@@ -244,11 +302,10 @@ void acceptBeat(int candidate) {
     return;
   }
 
-  // Stable mode
-  if (abs(candidate - displayHR) <= HR_MAX_JUMP_STABLE) {
-    displayHR    = candidate;
-    lastKnownHR  = candidate;
+  // Normal accepted range
+  if (displayHR == 0 || abs(candidate - lastKnownHR) <= HR_MAX_JUMP_STABLE) {
     stuckCounter = 0;
+    updateStableDisplayHR(candidate);
   } else {
     stuckCounter++;
     if (stuckCounter >= HR_STUCK_LIMIT) {
@@ -276,7 +333,6 @@ void handleFingerDetected(long irValue) {
 
     if (lastKnownHR > 0) {
       seedBuffer(lastKnownHR);
-      smoothedHR = lastKnownHR;
     }
 
     heartSensor.check();
@@ -306,7 +362,7 @@ void handleFingerDetected(long irValue) {
     bpmBufIdx++;
     if (bpmBufCount < BPM_BUF_SIZE) bpmBufCount++;
 
-    int candidate = (int)(getMedianBPM() + 0.5f);
+    int candidate = (int)(getWeightedMeanBPM() + 0.5f);
     acceptBeat(candidate);
   }
 }
@@ -328,7 +384,6 @@ void handleFingerRemoved() {
 // ============================================================
 // SPO2
 // ============================================================
-
 void shiftSpO2Buffer() {
   for (byte i = SPO2_SHIFT; i < SPO2_BUFFER_LEN; i++) {
     redBuffer[i - SPO2_SHIFT] = redBuffer[i];
@@ -369,7 +424,6 @@ void processSpO2Buffer() {
 // ============================================================
 // IMU / MOTION
 // ============================================================
-
 void sampleIMU() {
   float gyroX = myIMU.readFloatGyroX();
   float gyroY = myIMU.readFloatGyroY();
@@ -412,7 +466,6 @@ void evaluateMotionStatus() {
 // ============================================================
 // BLE / LED
 // ============================================================
-
 void broadcastMasterTime(unsigned long masterTime) {
   if (Bluefruit.connected()) {
     bleuart.println("SYNC,MT:" + String(masterTime));
@@ -432,7 +485,6 @@ void updateStatusLED() {
 // ============================================================
 // SETUP
 // ============================================================
-
 void setup() {
   Serial.begin(115200);
   delay(2000);
@@ -480,7 +532,6 @@ void setup() {
 // ============================================================
 // MAIN LOOP
 // ============================================================
-
 void loop() {
   heartSensor.check();
 
