@@ -51,11 +51,13 @@ unsigned long lastVitalsTxTime      = 0;
 unsigned long lastImuReadTime       = 0;
 unsigned long lastWaveUploadTime    = 0;
 unsigned long lastTimeSyncRequestMs = 0;
+unsigned long lastLedBlinkTime      = 0;
 
 const unsigned long VITALS_TX_INTERVAL_MS = 500;
 const unsigned long IMU_READ_INTERVAL_MS  = 20;
 const unsigned long TIME_SYNC_REQUEST_MS  = 60000;
 const unsigned long WAVE_UPLOAD_PERIOD_MS = 120000;
+const unsigned long LED_BLINK_INTERVAL_MS = 500;
 
 // ============================================================
 // TIME SYNC
@@ -147,6 +149,8 @@ const int HR_STUCK_LIMIT = 6;
 const unsigned long HR_STALE_MS = 30000UL;
 const unsigned long WARMUP_MS = 200; // Changed from 500 → 200
 
+const long IR_CONTACT_THRESHOLD = 20000; // Finger: standard threshold
+
 int smoothedHR = 0;
 float bpmBuffer[BPM_BUF_SIZE];
 int bpmBufIdx = 0, bpmBufCount = 0;
@@ -173,8 +177,38 @@ float seaLevelPressure_hPa = 1013.25;
 float accumulatedGyro = 0.0, accMagSum = 0.0, accMagSqSum = 0.0;
 int motionSampleCount = 0;
 String motionStatus = "Unknown";
-const float GYRO_STILL_THRESHOLD = 15.0, GYRO_ACTIVE_THRESHOLD = 80.0, ACC_VARIANCE_THRESHOLD = 0.01;
+const float GYRO_STILL_THRESHOLD  = 20.0;   // Raised from 15.0 — micro finger tremors won't falsely trigger
+const float GYRO_ACTIVE_THRESHOLD = 150.0;  // Raised from 80.0 — requires fast finger wave for Active Motion
+const float ACC_VARIANCE_THRESHOLD = 0.02;  // Raised from 0.01 — gentle tilts stay in Minor Motion
 bool sensorError = false;
+
+// ============================================================
+// LED STATE
+// ============================================================
+bool ledBlinkState = false;
+
+void updateLED() {
+  // Always reflect sensor contact state with red/green
+  if (fingerOn) {
+    digitalWrite(LED_GREEN, LOW);  // Green when contact detected
+    digitalWrite(LED_RED,   HIGH); // Red off
+  } else {
+    digitalWrite(LED_RED,   LOW);  // Red when no contact
+    digitalWrite(LED_GREEN, HIGH); // Green off
+  }
+
+  // Blue blinks on top until BLE is connected
+  if (!Bluefruit.connected()) {
+    unsigned long now = millis();
+    if (now - lastLedBlinkTime >= LED_BLINK_INTERVAL_MS) {
+      lastLedBlinkTime = now;
+      ledBlinkState = !ledBlinkState;
+    }
+    digitalWrite(LED_BLUE, ledBlinkState ? LOW : HIGH);
+  } else {
+    digitalWrite(LED_BLUE, HIGH); // Blue off once connected
+  }
+}
 
 // ============================================================
 // WAVEFORM BUFFER
@@ -221,7 +255,7 @@ void sendWaveformWindow() {
     line += ",IR:";
     for (uint8_t i = 0; i < WF_CHUNK_SAMPLES && (sent + i) < WAVE_UPLOAD_SAMPLES; i++) {
       line += String(irWaveRing[(startIdx + sent + i) % WAVE_RING_SAMPLES]);
-      if (i < WF_CHUNK_SAMPLES - 1 && (sent + i + 1) < WAVE_UPLOAD_HAPPENS) line += "|";
+      if (i < WF_CHUNK_SAMPLES - 1 && (sent + i + 1) < WAVE_UPLOAD_SAMPLES) line += "|"; // Fixed: WAVE_UPLOAD_HAPPENS → WAVE_UPLOAD_SAMPLES
     }
     bleuart.println(line);
     delay(8);
@@ -370,7 +404,7 @@ void loop() {
   while (heartSensor.available()) {
     uint32_t r = heartSensor.getFIFORed(), i = heartSensor.getFIFOIR();
     redBuffer[bufferIndex] = r; irBuffer[bufferIndex] = i;
-    if (i > 20000) { handleFingerDetected(i); storeWaveSample(r, i); }
+    if (i > IR_CONTACT_THRESHOLD) { handleFingerDetected(i); storeWaveSample(r, i); }
     else handleFingerRemoved();
     heartSensor.nextSample(); bufferIndex++;
     if (bufferIndex >= SPO2_BUFFER_LEN) processSpO2Buffer();
@@ -380,4 +414,5 @@ void loop() {
   if (Bluefruit.connected() && (now - lastTimeSyncRequestMs >= TIME_SYNC_REQUEST_MS || !timeSynced)) { lastTimeSyncRequestMs = now; requestTimeSync(); }
   if (now - lastVitalsTxTime >= VITALS_TX_INTERVAL_MS) { lastVitalsTxTime = now; sendVitalsPacket(); }
   if (ENABLE_WAVEFORM_TX && Bluefruit.connected() && timeSynced && (now - lastWaveUploadTime >= WAVE_UPLOAD_PERIOD_MS)) { lastWaveUploadTime = now; sendWaveformWindow(); }
+  updateLED();
 }
