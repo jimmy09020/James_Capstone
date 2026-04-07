@@ -1,0 +1,383 @@
+#include <bluefruit.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include "LSM6DS3.h"
+
+// ============================================================
+// PERIPHERAL INSTANCES
+// ============================================================
+BLEUart bleuart;
+Adafruit_BMP280 bmp;
+MAX30105 heartSensor;
+LSM6DS3 myIMU(I2C_MODE, 0x6A);
+
+// ============================================================
+// DEVICE ROLE / SYSTEM CONFIG
+// ============================================================
+enum DeviceRole : uint8_t {
+  ROLE_FOREHEAD   = 1,
+  ROLE_UPPERCHEST = 2,
+  ROLE_BICEP      = 3,
+  ROLE_WAIST      = 4,
+  ROLE_FINGER     = 5
+};
+
+// -------- CHANGE THESE FOR EACH NODE --------
+static const DeviceRole DEVICE_ROLE = ROLE_FINGER;
+
+// Automatically enable waveform only for Forehead and Finger nodes
+static const bool ENABLE_WAVEFORM_TX = (DEVICE_ROLE == ROLE_FOREHEAD || DEVICE_ROLE == ROLE_FINGER);
+// -----------------------------------------------
+
+const char* roleName(DeviceRole role) {
+  switch (role) {
+    case ROLE_FOREHEAD:   return "Halo_Forehead";
+    case ROLE_UPPERCHEST: return "Halo_UpperChest";
+    case ROLE_BICEP:      return "Halo_Bicep";
+    case ROLE_WAIST:      return "Halo_Waist";
+    case ROLE_FINGER:     return "Halo_Finger";
+    default:              return "Halo_Node";
+  }
+}
+
+// ============================================================
+// TIMING
+// ============================================================
+unsigned long lastVitalsTxTime      = 0;
+unsigned long lastImuReadTime       = 0;
+unsigned long lastWaveUploadTime    = 0;
+unsigned long lastTimeSyncRequestMs = 0;
+
+const unsigned long VITALS_TX_INTERVAL_MS = 500;
+const unsigned long IMU_READ_INTERVAL_MS  = 20;
+const unsigned long TIME_SYNC_REQUEST_MS  = 60000;
+const unsigned long WAVE_UPLOAD_PERIOD_MS = 120000;
+
+// ============================================================
+// TIME SYNC
+// ============================================================
+int64_t clockOffsetMs = 0;
+bool timeSynced = false;
+uint32_t vitalsSeq = 0;
+uint32_t waveSeq = 0;
+uint32_t tsAckSeq = 0;
+
+uint64_t syncedNowMs() {
+  return (uint64_t)((int64_t)millis() + clockOffsetMs);
+}
+
+// FIXED: Manual u64 conversion to avoid "lu" formatting bug
+String u64ToString(uint64_t value) {
+  if (value == 0) return "0";
+  String s = "";
+  while (value > 0) {
+    s = String((uint8_t)(value % 10)) + s;
+    value /= 10;
+  }
+  return s;
+}
+
+void applyTimeSyncFromApp(uint64_t appEpochMs) {
+  clockOffsetMs = (int64_t)appEpochMs - (int64_t)millis();
+  timeSynced = true;
+}
+
+void sendTimeSyncAck(uint64_t appEpochMs) {
+  if (!Bluefruit.connected()) return;
+  String ack = "TS_ACK,ROLE:" + String((int)DEVICE_ROLE) + ",SEQ:" + String(tsAckSeq++) + ",LOCAL_MS:" + String(millis()) + ",SYNC_MS:" + u64ToString(syncedNowMs()) + ",APP_MS:" + u64ToString(appEpochMs);
+  bleuart.println(ack);
+}
+
+void requestTimeSync() {
+  if (!Bluefruit.connected()) return;
+  String req = "TS_REQ,ROLE:" + String((int)DEVICE_ROLE) + ",LOCAL_MS:" + String(millis()) + ",SYNC_MS:" + u64ToString(syncedNowMs()) + ",SYNCED:" + String(timeSynced ? 1 : 0);
+  bleuart.println(req);
+}
+
+// ============================================================
+// BLE RX
+// ============================================================
+String bleRxLine = "";
+
+void handleBleIncomingLine(const String& line) {
+  if (!line.startsWith("TS,")) return;
+  int idx = line.indexOf("APP_MS:");
+  if (idx < 0) return;
+  int start = idx + 7;
+  int end = line.indexOf(',', start);
+  String epochStr = (end < 0) ? line.substring(start) : line.substring(start, end);
+  uint64_t appEpochMs = strtoull(epochStr.c_str(), nullptr, 10);
+  applyTimeSyncFromApp(appEpochMs);
+  sendTimeSyncAck(appEpochMs);
+}
+
+void pollBleRx() {
+  while (bleuart.available()) {
+    char c = (char)bleuart.read();
+    if (c == '\n' || c == '\r') {
+      if (bleRxLine.length() > 0) {
+        handleBleIncomingLine(bleRxLine);
+        bleRxLine = "";
+      }
+    } else {
+      bleRxLine += c;
+      if (bleRxLine.length() > 180) bleRxLine = "";
+    }
+  }
+}
+
+// ============================================================
+// HEART RATE & SPO2 LOGIC
+// ============================================================
+const int BPM_BUF_SIZE = 5;
+const float BPM_LOW = 40.0;
+const float BPM_HIGH = 180.0;
+const int HR_PASSTHROUGH_BAND = 8;
+const int HR_SMOOTH_STEP = 5;
+const int HR_MAX_JUMP_STABLE = 15;
+const int HR_REACQ_AGREE = 15;
+const int HR_COLD_LOCK_COUNT = 2;   // Changed from 3 → 2
+const int HR_SEED_LOCK_COUNT = 1;   // Changed from 2 → 1
+const int HR_SEED_GATE = 20;
+const int HR_STUCK_LIMIT = 6;
+const unsigned long HR_STALE_MS = 30000UL;
+const unsigned long WARMUP_MS = 200; // Changed from 500 → 200
+
+int smoothedHR = 0;
+float bpmBuffer[BPM_BUF_SIZE];
+int bpmBufIdx = 0, bpmBufCount = 0;
+long lastBeatMs = 0;
+int displayHR = 0, lastKnownHR = 0;
+unsigned long fingerOffTime = 0, fingerOnTime = 0;
+bool reacqMode = true;
+int reacqLastBeat = 0, reacqAgreeCount = 0, stuckCounter = 0;
+bool fingerOn = false, warmupDone = false;
+int noFingerCounter = 0;
+
+const int32_t SPO2_BUFFER_LEN = 100;
+const byte SPO2_SHIFT = 25;
+uint32_t irBuffer[SPO2_BUFFER_LEN], redBuffer[SPO2_BUFFER_LEN];
+int32_t spo2 = 0, maximHeartRate = 0, displaySpO2 = 0;
+int8_t validSPO2 = 0, maximValidHR = 0;
+byte bufferIndex = 0;
+bool spo2WarmupDone = false;
+int spo2ConsecutiveValid = 0;
+const int SPO2_CONFIRM_COUNT = 2;
+
+float seaLevelPressure_hPa = 1013.25;
+
+float accumulatedGyro = 0.0, accMagSum = 0.0, accMagSqSum = 0.0;
+int motionSampleCount = 0;
+String motionStatus = "Unknown";
+const float GYRO_STILL_THRESHOLD = 15.0, GYRO_ACTIVE_THRESHOLD = 80.0, ACC_VARIANCE_THRESHOLD = 0.01;
+bool sensorError = false;
+
+// ============================================================
+// WAVEFORM BUFFER
+// ============================================================
+static const uint16_t PPG_SAMPLE_RATE_HZ = 50;
+static const uint16_t WAVE_UPLOAD_WINDOW_SEC = 30;
+static const uint16_t WAVE_UPLOAD_SAMPLES = PPG_SAMPLE_RATE_HZ * WAVE_UPLOAD_WINDOW_SEC;
+static const uint16_t WAVE_RING_SECONDS = 180;
+static const uint32_t WAVE_RING_SAMPLES = PPG_SAMPLE_RATE_HZ * WAVE_RING_SECONDS;
+static const uint8_t WF_CHUNK_SAMPLES = 10;
+
+uint16_t redWaveRing[WAVE_RING_SAMPLES];
+uint16_t irWaveRing[WAVE_RING_SAMPLES];
+uint32_t waveWriteIndex = 0, totalWaveSamplesCaptured = 0;
+
+void storeWaveSample(uint32_t redRaw, uint32_t irRaw) {
+  if (!ENABLE_WAVEFORM_TX || !fingerOn) return;
+  redWaveRing[waveWriteIndex] = (uint16_t)min((uint32_t)65535, (redRaw >> 2));
+  irWaveRing[waveWriteIndex]  = (uint16_t)min((uint32_t)65535, (irRaw  >> 2));
+  waveWriteIndex = (waveWriteIndex + 1) % WAVE_RING_SAMPLES;
+  totalWaveSamplesCaptured++;
+}
+
+void sendWaveformWindow() {
+  if (!ENABLE_WAVEFORM_TX || !Bluefruit.connected() || !timeSynced) return;
+  uint32_t availableSamples = min(totalWaveSamplesCaptured, (uint32_t)WAVE_RING_SAMPLES);
+  if (availableSamples < WAVE_UPLOAD_SAMPLES) return;
+
+  uint32_t seq = waveSeq++;
+  int32_t startIdx = (int32_t)waveWriteIndex - (int32_t)WAVE_UPLOAD_SAMPLES;
+  if (startIdx < 0) startIdx += WAVE_RING_SAMPLES;
+
+  uint64_t endSync = syncedNowMs();
+  uint64_t startSync = endSync - ((uint64_t)(WAVE_UPLOAD_SAMPLES - 1) * (1000 / PPG_SAMPLE_RATE_HZ));
+
+  bleuart.println("WF_START,ROLE:" + String((int)DEVICE_ROLE) + ",SEQ:" + String(seq) + ",TS0:" + u64ToString(startSync) + ",DT_MS:" + String(1000 / PPG_SAMPLE_RATE_HZ) + ",N:" + String(WAVE_UPLOAD_SAMPLES));
+
+  for (uint32_t sent = 0; sent < WAVE_UPLOAD_SAMPLES; sent += WF_CHUNK_SAMPLES) {
+    String line = "WF_DATA,ROLE:" + String((int)DEVICE_ROLE) + ",SEQ:" + String(seq) + ",OFFSET:" + String(sent) + ",RED:";
+    for (uint8_t i = 0; i < WF_CHUNK_SAMPLES && (sent + i) < WAVE_UPLOAD_SAMPLES; i++) {
+      line += String(redWaveRing[(startIdx + sent + i) % WAVE_RING_SAMPLES]);
+      if (i < WF_CHUNK_SAMPLES - 1 && (sent + i + 1) < WAVE_UPLOAD_SAMPLES) line += "|";
+    }
+    line += ",IR:";
+    for (uint8_t i = 0; i < WF_CHUNK_SAMPLES && (sent + i) < WAVE_UPLOAD_SAMPLES; i++) {
+      line += String(irWaveRing[(startIdx + sent + i) % WAVE_RING_SAMPLES]);
+      if (i < WF_CHUNK_SAMPLES - 1 && (sent + i + 1) < WAVE_UPLOAD_HAPPENS) line += "|";
+    }
+    bleuart.println(line);
+    delay(8);
+  }
+  bleuart.println("WF_END,ROLE:" + String((int)DEVICE_ROLE) + ",SEQ:" + String(seq));
+}
+
+// ============================================================
+// HELPERS & PACKETS
+// ============================================================
+float getMedianBPM() {
+  int n = (bpmBufCount < BPM_BUF_SIZE) ? bpmBufCount : BPM_BUF_SIZE;
+  float sorted[BPM_BUF_SIZE];
+  for (int i = 0; i < n; i++) sorted[i] = bpmBuffer[i];
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) { float tmp = sorted[j]; sorted[j] = sorted[j + 1]; sorted[j + 1] = tmp; }
+    }
+  }
+  return sorted[n / 2];
+}
+
+void updateSmoothedHR() {
+  if (displayHR == 0) { smoothedHR = 0; return; }
+  if (smoothedHR == 0) { smoothedHR = displayHR; return; }
+  int diff = displayHR - smoothedHR;
+  if (abs(diff) <= HR_PASSTHROUGH_BAND) smoothedHR = displayHR;
+  else smoothedHR += (diff > 0) ? HR_SMOOTH_STEP : -HR_SMOOTH_STEP;
+}
+
+void seedBuffer(int refHR) { for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = (float)refHR; bpmBufIdx = 0; bpmBufCount = BPM_BUF_SIZE; }
+
+void enterReacq() {
+  reacqMode = true; reacqLastBeat = 0; reacqAgreeCount = 0; stuckCounter = 0;
+  if (displayHR > 0) { lastKnownHR = displayHR; seedBuffer(displayHR); }
+  else if (lastKnownHR > 0) seedBuffer(lastKnownHR);
+  displayHR = 0;
+}
+
+void resetHRState() { bpmBufIdx = 0; bpmBufCount = 0; lastBeatMs = 0; displayHR = 0; smoothedHR = 0; warmupDone = false; reacqMode = true; reacqLastBeat = 0; reacqAgreeCount = 0; stuckCounter = 0; for (int i = 0; i < BPM_BUF_SIZE; i++) bpmBuffer[i] = 0; }
+void resetSpO2State() { bufferIndex = 0; spo2WarmupDone = false; spo2ConsecutiveValid = 0; }
+
+void acceptBeat(int candidate) {
+  if (reacqMode) {
+    bool hasRef = (lastKnownHR > 0);
+    int lockCount = hasRef ? HR_SEED_LOCK_COUNT : HR_COLD_LOCK_COUNT;
+    if (hasRef && abs(candidate - lastKnownHR) > HR_SEED_GATE) { reacqLastBeat = 0; reacqAgreeCount = 0; return; }
+    if (reacqLastBeat == 0) { reacqLastBeat = candidate; reacqAgreeCount = 1; return; }
+    if (abs(candidate - reacqLastBeat) <= HR_REACQ_AGREE) {
+      reacqAgreeCount++; reacqLastBeat = candidate;
+      if (reacqAgreeCount >= lockCount) { displayHR = candidate; lastKnownHR = candidate; stuckCounter = 0; reacqMode = false; }
+    } else { reacqLastBeat = candidate; reacqAgreeCount = 1; }
+    return;
+  }
+  if (abs(candidate - displayHR) <= HR_MAX_JUMP_STABLE) { displayHR = candidate; lastKnownHR = candidate; stuckCounter = 0; }
+  else { stuckCounter++; if (stuckCounter >= HR_STUCK_LIMIT) { lastKnownHR = candidate; enterReacq(); } }
+}
+
+void handleFingerDetected(long irValue) {
+  noFingerCounter = 0;
+  if (!fingerOn) {
+    fingerOn = true; fingerOnTime = millis();
+    if (lastKnownHR > 0 && fingerOffTime > 0 && (millis() - fingerOffTime) > HR_STALE_MS) lastKnownHR = 0;
+    resetHRState(); resetSpO2State();
+    if (lastKnownHR > 0) { seedBuffer(lastKnownHR); smoothedHR = lastKnownHR; }
+    heartSensor.check(); while (heartSensor.available()) heartSensor.nextSample();
+    return;
+  }
+  if (!warmupDone) { checkForBeat(irValue); if (millis() - fingerOnTime < WARMUP_MS) return; warmupDone = true; lastBeatMs = millis(); return; }
+  if (checkForBeat(irValue)) {
+    long now = millis(); long delta = now - lastBeatMs; lastBeatMs = now;
+    if (delta < 333 || delta > 1500) return;
+    float bpm = 60000.0f / (float)delta;
+    if (bpm < BPM_LOW || bpm > BPM_HIGH) return;
+    bpmBuffer[bpmBufIdx % BPM_BUF_SIZE] = bpm; bpmBufIdx++;
+    if (bpmBufCount < BPM_BUF_SIZE) bpmBufCount++;
+    acceptBeat((int)(getMedianBPM() + 0.5f));
+  }
+}
+
+void handleFingerRemoved() {
+  noFingerCounter++;
+  if (noFingerCounter > 50) {
+    if (displayHR > 0) { lastKnownHR = displayHR; fingerOffTime = millis(); }
+    fingerOn = false; displayHR = 0; displaySpO2 = 0; resetHRState();
+  }
+}
+
+void shiftSpO2Buffer() { for (byte i = SPO2_SHIFT; i < SPO2_BUFFER_LEN; i++) { redBuffer[i - SPO2_SHIFT] = redBuffer[i]; irBuffer[i - SPO2_SHIFT] = irBuffer[i]; } bufferIndex = SPO2_BUFFER_LEN - SPO2_SHIFT; }
+
+void processSpO2Buffer() {
+  if (!fingerOn) { bufferIndex = 0; return; }
+  if (!spo2WarmupDone) { spo2WarmupDone = true; bufferIndex = 0; return; }
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, SPO2_BUFFER_LEN, redBuffer, &spo2, &validSPO2, &maximHeartRate, &maximValidHR);
+  if (validSPO2 == 1 && spo2 >= 85 && spo2 <= 100) {
+    spo2ConsecutiveValid++; if (spo2ConsecutiveValid >= SPO2_CONFIRM_COUNT) displaySpO2 = spo2;
+  } else spo2ConsecutiveValid = 0;
+  shiftSpO2Buffer();
+}
+
+void sampleIMU() {
+  float gx = myIMU.readFloatGyroX(), gy = myIMU.readFloatGyroY(), gz = myIMU.readFloatGyroZ();
+  accumulatedGyro += sqrt(gx*gx + gy*gy + gz*gz);
+  float ax = myIMU.readFloatAccelX(), ay = myIMU.readFloatAccelY(), az = myIMU.readFloatAccelZ();
+  float am = sqrt(ax*ax + ay*ay + az*az);
+  accMagSum += am; accMagSqSum += am * am; motionSampleCount++;
+}
+
+void evaluateMotionStatus() {
+  if (motionSampleCount == 0) return;
+  float n = (float)motionSampleCount, meanMag = accMagSum / n, accVar = (accMagSqSum / n) - (meanMag * meanMag);
+  float avgGyro = accumulatedGyro / n;
+  accumulatedGyro = 0; accMagSum = 0; accMagSqSum = 0; motionSampleCount = 0;
+  if (avgGyro < GYRO_STILL_THRESHOLD && accVar < ACC_VARIANCE_THRESHOLD) motionStatus = "Still";
+  else if (avgGyro > GYRO_ACTIVE_THRESHOLD) motionStatus = "Active Motion";
+  else motionStatus = "Minor Motion";
+}
+
+void sendVitalsPacket() {
+  updateSmoothedHR(); evaluateMotionStatus();
+  float tempF = bmp.readTemperature() * 1.8f + 32.0f;
+  float pressure = bmp.readPressure() / 100.0f;
+  float altitude = bmp.readAltitude(seaLevelPressure_hPa);
+  String packet = "VT,ROLE:" + String((int)DEVICE_ROLE) + ",SEQ:" + String(vitalsSeq++) + ",LOCAL_MS:" + String(millis()) + ",SYNC_MS:" + u64ToString(syncedNowMs()) + ",SYNCED:" + String(timeSynced ? 1 : 0) + ",CONTACT:" + String(fingerOn ? 1 : 0) + ",HR:" + String(smoothedHR) + ",SPO2:" + String(displaySpO2) + ",TEMP_F:" + String(tempF, 1) + ",PRESS:" + String(pressure, 1) + ",ALT:" + String(altitude, 1) + ",MOTION:" + motionStatus;
+  Serial.println(packet);
+  if (Bluefruit.connected()) bleuart.println(packet);
+}
+
+void setup() {
+  Serial.begin(115200); delay(2000);
+  pinMode(LED_RED, OUTPUT); pinMode(LED_GREEN, OUTPUT); pinMode(LED_BLUE, OUTPUT);
+  digitalWrite(LED_RED, HIGH); digitalWrite(LED_GREEN, HIGH); digitalWrite(LED_BLUE, HIGH);
+  Wire.begin();
+  if (!bmp.begin(0x76)) { Serial.println("BMP280 fail"); sensorError = true; }
+  if (!heartSensor.begin(Wire, I2C_SPEED_FAST)) { Serial.println("MAX30105 fail"); sensorError = true; }
+  else { heartSensor.setup(); heartSensor.setPulseAmplitudeRed(0x1F); heartSensor.setPulseAmplitudeIR(0x1F); }
+  if (myIMU.begin() != 0) { Serial.println("LSM6DS3 fail"); sensorError = true; }
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX); Bluefruit.begin(); Bluefruit.setName(roleName(DEVICE_ROLE)); bleuart.begin();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addService(bleuart); Bluefruit.ScanResponse.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true); Bluefruit.Advertising.start(0);
+}
+
+void loop() {
+  pollBleRx(); heartSensor.check();
+  while (heartSensor.available()) {
+    uint32_t r = heartSensor.getFIFORed(), i = heartSensor.getFIFOIR();
+    redBuffer[bufferIndex] = r; irBuffer[bufferIndex] = i;
+    if (i > 20000) { handleFingerDetected(i); storeWaveSample(r, i); }
+    else handleFingerRemoved();
+    heartSensor.nextSample(); bufferIndex++;
+    if (bufferIndex >= SPO2_BUFFER_LEN) processSpO2Buffer();
+  }
+  unsigned long now = millis();
+  if (now - lastImuReadTime >= IMU_READ_INTERVAL_MS) { lastImuReadTime = now; sampleIMU(); }
+  if (Bluefruit.connected() && (now - lastTimeSyncRequestMs >= TIME_SYNC_REQUEST_MS || !timeSynced)) { lastTimeSyncRequestMs = now; requestTimeSync(); }
+  if (now - lastVitalsTxTime >= VITALS_TX_INTERVAL_MS) { lastVitalsTxTime = now; sendVitalsPacket(); }
+  if (ENABLE_WAVEFORM_TX && Bluefruit.connected() && timeSynced && (now - lastWaveUploadTime >= WAVE_UPLOAD_PERIOD_MS)) { lastWaveUploadTime = now; sendWaveformWindow(); }
+}
