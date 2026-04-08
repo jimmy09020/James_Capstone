@@ -135,7 +135,7 @@ void pollBleRx() {
 // ============================================================
 // HEART RATE & SPO2 LOGIC
 // ============================================================
-const int BPM_BUF_SIZE = 5;
+const int BPM_BUF_SIZE = 3;
 const float BPM_LOW = 40.0;
 const float BPM_HIGH = 180.0;
 const int HR_PASSTHROUGH_BAND = 8;
